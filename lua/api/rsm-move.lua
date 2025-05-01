@@ -120,6 +120,39 @@ vim.api.nvim_create_user_command('Note', function()
   vim.cmd('edit ' .. file)
 end, {})
 
+vim.api.nvim_create_user_command('Port', function(opts)
+  local port_name = opts.args
+  local dbs_object = {
+    localhost = 5432,
+    ['dev-uni'] = 63342,
+    ['dev-identity'] = 63343,
+    ['dev-product'] = 63344,
+    ['dev-delivery'] = 63350,
+    ['dev-adopt'] = 63349,
+    ['dev-partner'] = 63351,
+    ['dev-orders'] = 63352,
+    ['uat-identity'] = 63345,
+    ['uat-delivery'] = 63346,
+    ['uat-product'] = 63347,
+    ['uat-uni'] = 63348,
+    ['uat-orders'] = 63353,
+    ['prod-uni'] = 63333,
+    ['prod-delivery'] = 63334,
+    ['prod-identity'] = 63337,
+    ['prod-product'] = 63335,
+    ['prod-orders'] = 63341,
+    REDSHIFT = 63340,
+  }
+
+  if dbs_object[port_name] then
+    local port = tostring(dbs_object[port_name])
+    vim.fn.setreg('+', port)
+    vim.notify("Port '" .. port .. "' copied to clipboard.", vim.log.levels.INFO)
+  else
+    vim.notify("Database with name '" .. port_name .. "' not found in the port object.", vim.log.levels.ERROR)
+  end
+end, { nargs = 1, desc = 'Copy database port to clipboard from the defined object. Usage: :Port <database_name>' })
+
 -- vim.api.nvim_create_user_command('Aws', function(opts)
 --   local args = vim.split(opts.args, ' ')
 --   local env = args[1]
