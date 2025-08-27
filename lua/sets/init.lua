@@ -3,6 +3,16 @@ local config = vim.fn.stdpath 'config'
 local macro = vim.fn.readfile(config .. '/lua/macros/interface-to-object')
 vim.fn.setreg('a', macro)
 
+-- Disable swap files to prevent conflicts
+vim.opt.swapfile = false
+vim.opt.backup = false
+vim.opt.writebackup = false
+
+-- Buffer safety settings
+vim.opt.hidden = true
+vim.opt.autowrite = true
+vim.opt.autowriteall = true
+
 vim.g.loaded_netrwPlugin = 1
 vim.g.loaded_netrw = 1
 vim.g.mapleader = ' '

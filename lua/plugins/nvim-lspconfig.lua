@@ -22,12 +22,23 @@ return {
           vim.keymap.set(mode, keys, func, { buffer = event.buf, desc = 'LSP: ' .. desc })
         end
 
-        map('gd', require('telescope.builtin').lsp_definitions, '[G]oto [D]efinition')
-        map('gr', require('telescope.builtin').lsp_references, '[G]oto [R]eferences')
-        map('gI', require('telescope.builtin').lsp_implementations, '[G]oto [I]mplementation')
-        map('<leader>D', require('telescope.builtin').lsp_type_definitions, 'Type [D]efinition')
-        map('<leader>ds', require('telescope.builtin').lsp_document_symbols, '[D]ocument [S]ymbols')
-        map('<leader>ws', require('telescope.builtin').lsp_dynamic_workspace_symbols, '[W]orkspace [S]ymbols')
+        -- Safe LSP navigation with error handling
+        local function safe_lsp_nav(nav_func, desc)
+          return function()
+            local ok, result = pcall(nav_func)
+            if not ok then
+              vim.notify("LSP navigation failed: " .. desc, vim.log.levels.WARN)
+            end
+          end
+        end
+
+        -- Use safe navigation for all LSP operations
+        map('gd', safe_lsp_nav(require('telescope.builtin').lsp_definitions, 'goto definition'), '[G]oto [D]efinition')
+        map('gr', safe_lsp_nav(require('telescope.builtin').lsp_references, 'goto references'), '[G]oto [R]eferences')
+        map('gI', safe_lsp_nav(require('telescope.builtin').lsp_implementations, 'goto implementation'), '[G]oto [I]mplementation')
+        map('<leader>D', safe_lsp_nav(require('telescope.builtin').lsp_type_definitions, 'type definition'), 'Type [D]efinition')
+        map('<leader>ds', safe_lsp_nav(require('telescope.builtin').lsp_document_symbols, 'document symbols'), '[D]ocument [S]ymbols')
+        map('<leader>ws', safe_lsp_nav(require('telescope.builtin').lsp_dynamic_workspace_symbols, 'workspace symbols'), '[W]orkspace [S]ymbols')
         map('<leader>rn', vim.lsp.buf.rename, '[R]e[n]ame')
         map('<leader>ca', vim.lsp.buf.code_action, '[C]ode [A]ction', { 'n', 'x' })
         map('gD', vim.lsp.buf.declaration, '[G]oto [D]eclaration')

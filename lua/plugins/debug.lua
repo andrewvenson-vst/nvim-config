@@ -212,7 +212,7 @@ return {
       end
     end
 
-    local js_filetypes = { 'typescript', 'javascript', 'typescriptreact', 'javascriptreact' }
+    local js_filetypes = { 'typescript', 'javascript', 'typescriptreact', 'javascriptreact', 'cucumber' }
 
     local vscode = require 'dap.ext.vscode'
 
@@ -234,6 +234,18 @@ return {
             name = 'Attach',
             processId = require('dap.utils').pick_process,
             cwd = '${workspaceFolder}',
+          },
+          {
+            type = 'pwa-node',
+            request = 'launch',
+            name = 'Debug Cucumber Test',
+            program = '${workspaceFolder}/node_modules/@cucumber/cucumber/bin/cucumber-js',
+            args = { '--require-module', 'ts-node/register', '${file}' },
+            cwd = '${workspaceFolder}',
+            console = 'integratedTerminal',
+            runtimeExecutable = 'node',
+            runtimeArgs = { '--inspect-brk' },
+            skipFiles = { '<node_internals>/**' },
           },
         }
       end

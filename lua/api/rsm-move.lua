@@ -28,8 +28,18 @@ vim.api.nvim_create_user_command('Delivery', function()
   vim.cmd 'edit package.json'
 end, {})
 
-vim.api.nvim_create_user_command('Billing', function()
+vim.api.nvim_create_user_command('PartnerTs', function()
+  vim.cmd('cd ' .. domains .. '/partner-ts')
+  vim.cmd 'edit package.json'
+end, {})
+
+vim.api.nvim_create_user_command('BillingTs', function()
   vim.cmd('cd ' .. domains .. '/billing-ts')
+  vim.cmd 'edit package.json'
+end, {})
+
+vim.api.nvim_create_user_command('BillingPy', function()
+  vim.cmd('cd ' .. domains .. '/billing_py')
   vim.cmd 'edit package.json'
 end, {})
 
@@ -75,6 +85,11 @@ end, {})
 
 vim.api.nvim_create_user_command('Shelf', function()
   vim.cmd('cd ' .. projects .. '/shelf-app')
+  vim.cmd 'edit package.json'
+end, {})
+
+vim.api.nvim_create_user_command('Toolbox', function()
+  vim.cmd('cd ' .. projects .. '/toolbox')
   vim.cmd 'edit package.json'
 end, {})
 

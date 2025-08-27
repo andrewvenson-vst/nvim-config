@@ -21,12 +21,55 @@ return { -- Fuzzy Finder (files, lsp, etc)
           require('telescope.themes').get_dropdown(),
         },
       },
+      -- Add safety defaults to prevent cursor errors
+      defaults = {
+        prompt_prefix = " ",
+        selection_caret = " ",
+        path_display = { "truncate" },
+        file_ignore_patterns = { "node_modules", ".git" },
+        set_env = { COLORTERM = "truecolor" },
+        -- Prevent cursor position errors
+        layout_strategy = "horizontal",
+        layout_config = {
+          horizontal = {
+            prompt_position = "top",
+            preview_width = 0.55,
+            results_width = 0.8,
+          },
+        },
+      },
+      pickers = {
+        -- Add safety for LSP operations
+        lsp_definitions = {
+          jump_type = "never", -- Don't jump automatically
+        },
+        lsp_references = {
+          jump_type = "never",
+        },
+        lsp_implementations = {
+          jump_type = "never",
+        },
+        lsp_type_definitions = {
+          jump_type = "never",
+        },
+      },
     }
 
     pcall(require('telescope').load_extension, 'fzf')
     pcall(require('telescope').load_extension, 'ui-select')
 
     local builtin = require 'telescope.builtin'
+    
+    -- Safe LSP navigation functions with error handling
+    local function safe_lsp_call(builtin_func, desc)
+      return function()
+        local ok, result = pcall(builtin_func)
+        if not ok then
+          vim.notify("Telescope LSP call failed: " .. desc, vim.log.levels.WARN)
+        end
+      end
+    end
+
     vim.keymap.set('n', '<leader>sh', builtin.help_tags, { desc = '[S]earch [H]elp' })
     vim.keymap.set('n', '<leader>sk', builtin.keymaps, { desc = '[S]earch [K]eymaps' })
     vim.keymap.set('n', '<leader>sf', builtin.find_files, { desc = '[S]earch [F]iles' })
