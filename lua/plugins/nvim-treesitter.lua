@@ -20,6 +20,7 @@ return { -- Highlight, edit, and navigate code
       'python',
       'javascript',
       'typescript',
+      'ruby',
     },
     -- Autoinstall languages that are not installed
     auto_install = true,

@@ -1,7 +1,4 @@
 local lazypath = vim.fn.stdpath 'data' .. '/lazy/lazy.nvim'
-local config = vim.fn.stdpath 'config'
-local macro = vim.fn.readfile(config .. '/lua/macros/interface-to-object')
-vim.fn.setreg('a', macro)
 
 -- Disable swap files to prevent conflicts
 vim.opt.swapfile = false

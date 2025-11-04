@@ -4,6 +4,69 @@ local mono = projects .. '/rsm-monorepo'
 local domains = mono .. '/domains'
 local config = home .. '/.config/nvim'
 
+-- ######## UTILS ##################################
+vim.api.nvim_create_user_command('Config', function()
+  vim.cmd('cd ' .. config)
+  vim.cmd 'edit init.lua'
+end, {})
+
+vim.api.nvim_create_user_command('Dad', function()
+  vim.cmd('cd ' .. home .. '/.local/share/nvim/lazy/vim-dadbod-ui/autoload')
+  vim.cmd 'edit db_ui.vim'
+end, {})
+
+vim.api.nvim_create_user_command('Tm', function()
+  vim.cmd('cd ' .. home)
+  vim.cmd 'edit .tmux.conf'
+end, {})
+
+vim.api.nvim_create_user_command('Zs', function()
+  vim.cmd('cd ' .. home)
+  vim.cmd 'edit .zshrc'
+end, {})
+
+vim.api.nvim_create_user_command('Note', function()
+  local current_date = os.date '%Y-%m-%d'
+  local file = current_date .. '.txt'
+  vim.cmd('cd ' .. home .. '/notes')
+  os.execute('touch ' .. file)
+  vim.cmd('edit ' .. file)
+end, {})
+
+vim.api.nvim_create_user_command('Models', function()
+  vim.cmd('cd ' .. domains .. '/models')
+  vim.cmd 'edit package.json'
+end, {})
+-- #################################################
+
+-- ######## VST ##################################
+vim.api.nvim_create_user_command('Bc', function()
+  vim.cmd('cd ' .. projects .. '/business-center')
+  vim.cmd 'edit README.md'
+end, {})
+
+vim.api.nvim_create_user_command('Dm', function()
+  vim.cmd('cd ' .. projects .. '/doorman')
+  vim.cmd 'edit README.md'
+end, {})
+
+vim.api.nvim_create_user_command('Po', function()
+  vim.cmd('cd ' .. projects .. '/program-orders')
+  vim.cmd 'edit README.md'
+end, {})
+
+vim.api.nvim_create_user_command('Co', function()
+  vim.cmd('cd ' .. projects .. '/connect')
+  vim.cmd 'edit README.md'
+end, {})
+
+vim.api.nvim_create_user_command('Ns', function()
+  vim.cmd('cd ' .. projects .. '/nsync')
+  vim.cmd 'edit README.md'
+end, {})
+-- #################################################
+
+-- ####### REDSHELF ################################
 vim.api.nvim_create_user_command('Mono', function()
   vim.cmd('cd ' .. mono)
 end, {})
@@ -107,34 +170,6 @@ vim.api.nvim_create_user_command('Orders', function()
   vim.cmd 'edit package.json'
 end, {})
 
-vim.api.nvim_create_user_command('Config', function()
-  vim.cmd('cd ' .. config)
-  vim.cmd 'edit init.lua'
-end, {})
-
-vim.api.nvim_create_user_command('Dad', function()
-  vim.cmd('cd ' .. home .. '/.local/share/nvim/lazy/vim-dadbod-ui/autoload')
-  vim.cmd 'edit db_ui.vim'
-end, {})
-
-vim.api.nvim_create_user_command('Tm', function()
-  vim.cmd('cd ' .. home)
-  vim.cmd 'edit .tmux.conf'
-end, {})
-
-vim.api.nvim_create_user_command('Zs', function()
-  vim.cmd('cd ' .. home)
-  vim.cmd 'edit .zshrc'
-end, {})
-
-vim.api.nvim_create_user_command('Note', function()
-  local current_date = os.date '%Y-%m-%d'
-  local file = current_date .. '.txt'
-  vim.cmd('cd ' .. home .. '/notes')
-  os.execute('touch ' .. file)
-  vim.cmd('edit ' .. file)
-end, {})
-
 vim.api.nvim_create_user_command('Port', function(opts)
   local port_name = opts.args
   local dbs_object = {
@@ -167,15 +202,4 @@ vim.api.nvim_create_user_command('Port', function(opts)
     vim.notify("Database with name '" .. port_name .. "' not found in the port object.", vim.log.levels.ERROR)
   end
 end, { nargs = 1, desc = 'Copy database port to clipboard from the defined object. Usage: :Port <database_name>' })
-
--- vim.api.nvim_create_user_command('Aws', function(opts)
---   local args = vim.split(opts.args, ' ')
---   local env = args[1]
---   local accessCode = args[2]
---
---   if env == '' or accessCode == '' then
---     print 'Must provide a env'
---     return
---   end
---   os.execute('. set-creds ' .. env .. ' ' .. accessCode)
--- end, { nargs = '*' })
+-- #################################################

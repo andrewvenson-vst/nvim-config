@@ -1,7 +1,6 @@
 return {
   require 'plugins.dadbod',
   require 'plugins.neo-tree',
-  require 'plugins.gitsigns',
   require 'plugins.which-key',
   require 'plugins.vim-tmux-navigator',
   require 'plugins.telescope',
@@ -12,13 +11,7 @@ return {
   require 'plugins.vim-fugitive',
   require 'plugins.vim-sleuth',
   require 'plugins.nvim-cmp',
-  require 'plugins.copilot-cmp',
-  require 'plugins.mini',
-  require 'plugins.lazydev',
   require 'plugins.comments',
-  require 'plugins.luvit-meta',
-  require 'plugins.copilot',
   require 'plugins.debug',
   require 'plugins.neotest',
-  --require 'plugins.avante',
 }
