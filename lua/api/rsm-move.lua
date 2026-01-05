@@ -1,7 +1,5 @@
 local home = os.getenv 'HOME'
 local projects = home .. '/projects'
-local mono = projects .. '/rsm-monorepo'
-local domains = mono .. '/domains'
 local config = home .. '/.config/nvim'
 
 -- ######## UTILS ##################################
@@ -45,6 +43,11 @@ vim.api.nvim_create_user_command('Bc', function()
   vim.cmd 'edit README.md'
 end, {})
 
+vim.api.nvim_create_user_command('Con', function()
+  vim.cmd('cd ' .. projects .. '/connect')
+  vim.cmd 'edit README.md'
+end, {})
+
 vim.api.nvim_create_user_command('Dm', function()
   vim.cmd('cd ' .. projects .. '/doorman')
   vim.cmd 'edit README.md'
@@ -67,6 +70,9 @@ end, {})
 -- #################################################
 
 -- ####### REDSHELF ################################
+local mono = projects .. '/rsm-monorepo'
+local domains = mono .. '/domains'
+
 vim.api.nvim_create_user_command('Mono', function()
   vim.cmd('cd ' .. mono)
 end, {})
@@ -169,37 +175,3 @@ vim.api.nvim_create_user_command('Orders', function()
   vim.cmd('cd ' .. projects .. '/orders-service')
   vim.cmd 'edit package.json'
 end, {})
-
-vim.api.nvim_create_user_command('Port', function(opts)
-  local port_name = opts.args
-  local dbs_object = {
-    localhost = 5432,
-    ['dev-uni'] = 63342,
-    ['dev-identity'] = 63343,
-    ['dev-product'] = 63344,
-    ['dev-delivery'] = 63350,
-    ['dev-adopt'] = 63349,
-    ['dev-partner'] = 63351,
-    ['dev-orders'] = 63352,
-    ['uat-identity'] = 63345,
-    ['uat-delivery'] = 63346,
-    ['uat-product'] = 63347,
-    ['uat-uni'] = 63348,
-    ['uat-orders'] = 63353,
-    ['prod-uni'] = 63333,
-    ['prod-delivery'] = 63334,
-    ['prod-identity'] = 63337,
-    ['prod-product'] = 63335,
-    ['prod-orders'] = 63341,
-    REDSHIFT = 63340,
-  }
-
-  if dbs_object[port_name] then
-    local port = tostring(dbs_object[port_name])
-    vim.fn.setreg('+', port)
-    vim.notify("Port '" .. port .. "' copied to clipboard.", vim.log.levels.INFO)
-  else
-    vim.notify("Database with name '" .. port_name .. "' not found in the port object.", vim.log.levels.ERROR)
-  end
-end, { nargs = 1, desc = 'Copy database port to clipboard from the defined object. Usage: :Port <database_name>' })
--- #################################################

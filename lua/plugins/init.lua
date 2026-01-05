@@ -9,6 +9,7 @@ return {
   require 'plugins.conform-nvim',
   require 'plugins.colorscheme',
   require 'plugins.vim-fugitive',
+  require 'plugins.gitsigns',
   require 'plugins.vim-sleuth',
   require 'plugins.nvim-cmp',
   require 'plugins.comments',

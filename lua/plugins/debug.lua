@@ -8,6 +8,7 @@ return {
       'williamboman/mason.nvim',
       'jay-babu/mason-nvim-dap.nvim',
       'theHamsta/nvim-dap-virtual-text',
+      'andrewvenson-vst/nvim-dap-ruby',
       opts = function(_, opts)
         opts.ensure_installed = opts.ensure_installed or {}
         table.insert(opts.ensure_installed, 'js-debug-adapter')
@@ -149,9 +150,12 @@ return {
   end,
 
   config = function()
+    require('dap-ruby').setup()
+
     local dap = require 'dap'
     local dapui = require 'dapui'
     local dapvirtual = require 'nvim-dap-virtual-text'
+
     dapvirtual.setup {
       enabled = true, -- enable this plugin (the default)
       enabled_commands = true, -- create commands DapVirtualTextEnable, DapVirtualTextDisable, DapVirtualTextToggle, (DapVirtualTextForceRefresh for refreshing when debug adapter did not notify its termination)
