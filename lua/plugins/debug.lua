@@ -54,6 +54,13 @@ return {
         desc = 'Run to Cursor',
       },
       {
+        '<leader>dX',
+        function()
+          require('dap').clear_breakpoints()
+        end,
+        desc = 'Clear Breakpoints',
+      },
+      {
         '<leader>dg',
         function()
           require('dap').goto_()
