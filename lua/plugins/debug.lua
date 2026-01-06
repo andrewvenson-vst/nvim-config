@@ -11,7 +11,6 @@ return {
       'andrewvenson-vst/nvim-dap-ruby',
       opts = function(_, opts)
         opts.ensure_installed = opts.ensure_installed or {}
-        table.insert(opts.ensure_installed, 'js-debug-adapter')
       end,
     },
   },
@@ -128,6 +127,7 @@ return {
         '<leader>dt',
         function()
           require('dap').terminate()
+          require('dapui').toggle()
         end,
         desc = 'Terminate',
       },
@@ -137,6 +137,13 @@ return {
           require('dap.ui.widgets').hover()
         end,
         desc = 'Widgets',
+      },
+      {
+        '<leader>du',
+        function()
+          require('dapui').toggle()
+        end,
+        desc = 'Toggle UI',
       },
       {
         '<leader>td',
@@ -156,6 +163,21 @@ return {
     local dapui = require 'dapui'
     local dapvirtual = require 'nvim-dap-virtual-text'
 
+    -- Define custom breakpoint signs with red circle
+    vim.fn.sign_define('DapBreakpoint', { text = '●', texthl = 'DapBreakpoint', linehl = '', numhl = '' })
+    vim.fn.sign_define('DapBreakpointCondition', { text = '●', texthl = 'DapBreakpointCondition', linehl = '', numhl = '' })
+    vim.fn.sign_define('DapBreakpointRejected', { text = '○', texthl = 'DapBreakpointRejected', linehl = '', numhl = '' })
+    vim.fn.sign_define('DapLogPoint', { text = '◆', texthl = 'DapLogPoint', linehl = '', numhl = '' })
+    vim.fn.sign_define('DapStopped', { text = '→', texthl = 'DapStopped', linehl = 'DapStoppedLine', numhl = '' })
+
+    -- Set highlight colors for breakpoint signs
+    vim.api.nvim_set_hl(0, 'DapBreakpoint', { fg = '#ff0000' }) -- Red
+    vim.api.nvim_set_hl(0, 'DapBreakpointCondition', { fg = '#ff8800' }) -- Orange
+    vim.api.nvim_set_hl(0, 'DapBreakpointRejected', { fg = '#888888' }) -- Gray
+    vim.api.nvim_set_hl(0, 'DapLogPoint', { fg = '#00ff00' }) -- Green
+    vim.api.nvim_set_hl(0, 'DapStopped', { fg = '#00aaff' }) -- Blue
+    vim.api.nvim_set_hl(0, 'DapStoppedLine', { bg = '#3f3f3f' }) -- Dark gray background
+
     dapvirtual.setup {
       enabled = true, -- enable this plugin (the default)
       enabled_commands = true, -- create commands DapVirtualTextEnable, DapVirtualTextDisable, DapVirtualTextToggle, (DapVirtualTextForceRefresh for refreshing when debug adapter did not notify its termination)
@@ -166,14 +188,6 @@ return {
       only_first_definition = true, -- only show virtual text at first definition (if there are multiple)
       all_references = false, -- show virtual text on all all references of the variable (not only definitions)
       clear_on_continue = false,
-    }
-
-    require('mason-nvim-dap').setup {
-      automatic_installation = true,
-      handlers = {},
-      ensure_installed = {
-        'js-debug-adapter',
-      },
     }
     dapui.setup {
       icons = { expanded = '▾', collapsed = '▸', current_frame = '*' },
@@ -191,70 +205,6 @@ return {
         },
       },
     }
-    if not dap.adapters['pwa-node'] then
-      require('dap').adapters['pwa-node'] = {
-        type = 'server',
-        host = 'localhost',
-        port = '${port}',
-        executable = {
-          command = 'node',
-          args = { '/Users/andrewvenson/projects/js-debug/src/dapDebugServer.js', '${port}' },
-        },
-      }
-    end
-    if not dap.adapters['node'] then
-      dap.adapters['node'] = function(cb, config)
-        if config.type == 'node' then
-          config.type = 'pwa-node'
-        end
-        local nativeAdapter = dap.adapters['pwa-node']
-        if type(nativeAdapter) == 'function' then
-          nativeAdapter(cb, config)
-        else
-          cb(nativeAdapter)
-        end
-      end
-    end
-
-    local js_filetypes = { 'typescript', 'javascript', 'typescriptreact', 'javascriptreact', 'cucumber' }
-
-    local vscode = require 'dap.ext.vscode'
-
-    vscode.type_to_filetypes['pwa-node'] = js_filetypes
-
-    for _, language in ipairs(js_filetypes) do
-      if not dap.configurations[language] then
-        dap.configurations[language] = {
-          {
-            type = 'pwa-node',
-            request = 'launch',
-            name = 'Launch file',
-            program = '${file}',
-            cwd = '${workspaceFolder}',
-          },
-          {
-            type = 'pwa-node',
-            request = 'attach',
-            name = 'Attach',
-            processId = require('dap.utils').pick_process,
-            cwd = '${workspaceFolder}',
-          },
-          {
-            type = 'pwa-node',
-            request = 'launch',
-            name = 'Debug Cucumber Test',
-            program = '${workspaceFolder}/node_modules/@cucumber/cucumber/bin/cucumber-js',
-            args = { '--require-module', 'ts-node/register', '${file}' },
-            cwd = '${workspaceFolder}',
-            console = 'integratedTerminal',
-            runtimeExecutable = 'node',
-            runtimeArgs = { '--inspect-brk' },
-            skipFiles = { '<node_internals>/**' },
-          },
-        }
-      end
-    end
-
     dap.listeners.after.event_initialized['dapui_config'] = dapui.open
     dap.listeners.before.event_terminated['dapui_config'] = dapui.close
     dap.listeners.before.event_exited['dapui_config'] = dapui.close

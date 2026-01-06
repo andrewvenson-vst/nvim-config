@@ -5,21 +5,10 @@ return {
     'nvim-treesitter/nvim-treesitter',
     'nvim-neotest/neotest-plenary',
     'nvim-neotest/nvim-nio',
-    'haydenmeade/neotest-jest',
     'olimorris/neotest-rspec',
   },
   opts = { adapters = { 'neotest-plenary' } },
   config = function(_, opts)
-    table.insert(
-      opts.adapters,
-      require 'neotest-jest' {
-        jestCommand = 'npm run test --',
-        env = { CI = true },
-        cwd = function()
-          return vim.fn.getcwd()
-        end,
-      }
-    )
     table.insert(opts.adapters, require 'neotest-rspec')
 
     local neotest_ns = vim.api.nvim_create_namespace 'neotest'
