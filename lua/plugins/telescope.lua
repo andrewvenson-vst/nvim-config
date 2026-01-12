@@ -24,7 +24,8 @@ return { -- Fuzzy Finder (files, lsp, etc)
       -- Add safety defaults to prevent cursor errors
       defaults = {
         prompt_prefix = ' ',
-        selection_caret = ' ',
+        selection_caret = '▸ ',
+        entry_prefix = ' ',
         path_display = { 'truncate' },
         file_ignore_patterns = { 'node_modules', '.git' },
         set_env = { COLORTERM = 'truecolor' },

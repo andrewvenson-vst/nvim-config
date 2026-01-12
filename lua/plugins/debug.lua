@@ -196,6 +196,7 @@ return {
       all_references = false, -- show virtual text on all all references of the variable (not only definitions)
       clear_on_continue = false,
     }
+
     dapui.setup {
       icons = { expanded = '▾', collapsed = '▸', current_frame = '*' },
       controls = {
