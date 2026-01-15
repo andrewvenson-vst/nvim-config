@@ -1,5 +1,5 @@
 return {
-  'kristijanhusak/vim-dadbod-ui',
+  'andrewvenson-vst/vim-dadbod-ui',
   dependencies = {
     { 'andrewvenson-vst/vim-dadbod', lazy = true },
     { 'kristijanhusak/vim-dadbod-completion', ft = { 'sql', 'mysql', 'plsql' }, lazy = true }, -- Optional
