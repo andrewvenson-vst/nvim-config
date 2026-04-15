@@ -8,11 +8,6 @@ vim.api.nvim_create_user_command('Config', function()
   vim.cmd 'edit init.lua'
 end, {})
 
-vim.api.nvim_create_user_command('Dad', function()
-  vim.cmd('cd ' .. home .. '/.local/share/nvim/lazy/vim-dadbod-ui/autoload')
-  vim.cmd 'edit db_ui.vim'
-end, {})
-
 vim.api.nvim_create_user_command('Tm', function()
   vim.cmd('cd ' .. home)
   vim.cmd 'edit .tmux.conf'
@@ -31,9 +26,14 @@ vim.api.nvim_create_user_command('Note', function()
   vim.cmd('edit ' .. file)
 end, {})
 
-vim.api.nvim_create_user_command('Models', function()
-  vim.cmd('cd ' .. domains .. '/models')
-  vim.cmd 'edit package.json'
+vim.api.nvim_create_user_command('Aro', function()
+  vim.cmd('cd ' .. home)
+  vim.cmd 'edit .aerospace.toml'
+end, {})
+
+vim.api.nvim_create_user_command('Temp', function()
+  vim.cmd('cd ' .. home .. '/temp')
+  vim.cmd 'edit temp_readme.md'
 end, {})
 -- #################################################
 
@@ -67,6 +67,7 @@ vim.api.nvim_create_user_command('Ns', function()
   vim.cmd('cd ' .. projects .. '/nsync')
   vim.cmd 'edit README.md'
 end, {})
+
 -- #################################################
 
 -- ####### REDSHELF ################################

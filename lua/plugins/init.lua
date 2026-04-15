@@ -15,4 +15,5 @@ return {
   require 'plugins.comments',
   require 'plugins.debug',
   require 'plugins.neotest',
+  require 'plugins.claudecode',
 }
