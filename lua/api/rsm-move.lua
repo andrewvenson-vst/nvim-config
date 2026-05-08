@@ -13,6 +13,16 @@ vim.api.nvim_create_user_command('Tm', function()
   vim.cmd 'edit .tmux.conf'
 end, {})
 
+vim.api.nvim_create_user_command('Cl', function()
+  vim.cmd('cd ' .. home .. '/.claude')
+  vim.cmd 'edit settings.json'
+end, {})
+
+vim.api.nvim_create_user_command('Cb', function()
+  vim.cmd('cd ' .. home .. '/projects/cobra-skills')
+  vim.cmd 'edit README.md'
+end, {})
+
 vim.api.nvim_create_user_command('Zs', function()
   vim.cmd('cd ' .. home)
   vim.cmd 'edit .zshrc'
