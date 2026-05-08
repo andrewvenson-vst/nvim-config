@@ -15,6 +15,8 @@ local state = {
 
 local pending_hls = {}
 
+local open_result_window
+
 local PAD = '   '
 local BAR = '┃'
 
@@ -354,24 +356,11 @@ local function emit_pr(lines, meta, pr, opts)
   paint(idx, cols)
   meta[idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo }, kind = 'pr' }
 
-  local sub = { { text = '       ┊ ', hl = 'NonText' } }
-  local has_meta = false
-  if pr.lastActivityAt and pr.lastActivityAuthor then
-    table.insert(sub, { text = pr.lastActivityAuthor, hl = 'Comment' })
-    table.insert(sub, { text = ' ', hl = nil })
-    local age, age_hl = relative_time(pr.lastActivityAt)
-    table.insert(sub, { text = age, hl = age_hl })
-    has_meta = true
-  end
   if pr.unresolvedThreads and pr.unresolvedThreads > 0 then
-    if has_meta then
-      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
-    end
-    table.insert(sub, { text = tostring(pr.unresolvedThreads) .. ' unresolved', hl = 'DiagnosticWarn' })
-    has_meta = true
-  end
-  if has_meta then
-    local sidx, scols = emit(lines, sub)
+    local sidx, scols = emit(lines, {
+      { text = '       ┊ ', hl = 'NonText' },
+      { text = tostring(pr.unresolvedThreads) .. ' unresolved', hl = 'DiagnosticWarn' },
+    })
     paint(sidx, scols)
   end
 end
@@ -399,20 +388,9 @@ local function emit_issue(lines, meta, issue, opts)
     table.insert(sub, { text = issue.qa_assignee, hl = '@string' })
     has_meta = true
   end
-  if issue.last_comment_at and issue.last_comment_author then
-    if has_meta then
-      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
-    end
-    table.insert(sub, { text = 'last: ', hl = 'Comment' })
-    table.insert(sub, { text = issue.last_comment_author, hl = 'Comment' })
-    table.insert(sub, { text = ' ', hl = nil })
-    local age, age_hl = relative_time(issue.last_comment_at)
-    table.insert(sub, { text = age, hl = age_hl })
-    has_meta = true
-  end
   if issue.status_change_at then
     if has_meta then
-      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
+      table.insert(sub, { text = '  ·  ', hl = 'Identifier' })
     end
     local age, age_hl = relative_time(issue.status_change_at)
     table.insert(sub, { text = 'in status ', hl = 'Comment' })
@@ -500,6 +478,10 @@ local function emit_legend(lines, segments)
   emit_segments(lines, prefixed)
 end
 
+local OPEN_BR = { text = '[ ', hl = 'NonText' }
+local CLOSE_BR = { text = ' ]', hl = 'NonText' }
+local GAP = { text = '   ', hl = nil }
+
 local function emit_header(lines)
   emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
   emit_legend(lines, {
@@ -516,10 +498,6 @@ local function emit_header(lines)
   })
   emit_blank(lines)
 end
-
-local OPEN_BR = { text = '[ ', hl = 'NonText' }
-local CLOSE_BR = { text = ' ]', hl = 'NonText' }
-local GAP = { text = '   ', hl = nil }
 
 local function emit_github_legend(lines)
   emit_legend(lines, {
@@ -550,6 +528,8 @@ local function emit_github_legend(lines)
     { text = ' checkout · ', hl = 'Comment' },
     { text = 'D', hl = '@keyword' },
     { text = ' diff · ', hl = 'Comment' },
+    { text = 't', hl = '@keyword' },
+    { text = ' threads · ', hl = 'Comment' },
     { text = 's', hl = '@keyword' },
     { text = ' summary · ', hl = 'Comment' },
     { text = '?', hl = '@keyword' },
@@ -758,6 +738,91 @@ local function open_diff_window(title, body)
   vim.keymap.set('n', '<Esc>', close, opts)
 end
 
+local function ago(iso)
+  local label = (relative_time(iso))
+  if label == '' then
+    return '?'
+  end
+  if label == 'now' then
+    return 'just now'
+  end
+  return label .. ' ago'
+end
+
+local function format_review_threads(threads, ctx_id)
+  local lines = {}
+  table.insert(lines, '# Review threads · ' .. ctx_id)
+  table.insert(lines, '')
+
+  local unresolved = {}
+  for _, t in ipairs(threads or {}) do
+    if not t.isResolved then
+      table.insert(unresolved, t)
+    end
+  end
+
+  if #unresolved == 0 then
+    table.insert(lines, '_No unresolved review threads._')
+    return table.concat(lines, '\n')
+  end
+
+  table.insert(lines, string.format('_%d unresolved %s_', #unresolved, #unresolved == 1 and 'thread' or 'threads'))
+  table.insert(lines, '')
+
+  for _, t in ipairs(unresolved) do
+    local cs = (t.comments and t.comments.nodes) or {}
+    local first = cs[1]
+    local opened_by = (first and first.author and first.author.login) or '?'
+    local path = t.path or '?'
+    local line_num = t.line or t.originalLine or '?'
+    local tag = t.isOutdated and ' _[outdated]_' or ''
+
+    table.insert(lines, string.format('## %s:%s%s', path, tostring(line_num), tag))
+    if first then
+      table.insert(lines, string.format('_%s opened %s_', opened_by, ago(first.createdAt)))
+    end
+    table.insert(lines, '')
+
+    if first and first.diffHunk and first.diffHunk ~= '' then
+      table.insert(lines, '```diff')
+      for _, l in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
+        table.insert(lines, l)
+      end
+      table.insert(lines, '```')
+      table.insert(lines, '')
+    end
+
+    for _, c in ipairs(cs) do
+      table.insert(lines, string.format('**%s** · %s', (c.author and c.author.login) or '?', ago(c.createdAt)))
+      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+        table.insert(lines, '> ' .. l)
+      end
+      table.insert(lines, '')
+    end
+
+    table.insert(lines, '---')
+    table.insert(lines, '')
+  end
+
+  return table.concat(lines, '\n')
+end
+
+function M.threads_under_cursor()
+  local m = under_cursor()
+  if not m or m.kind ~= 'pr' or not m.pr or not m.pr.repo or not m.pr.number then
+    return
+  end
+  local title = string.format('Threads · %s#%d', m.pr.repo, m.pr.number)
+  local handle = open_result_window(title, nil, 'Loading review threads…')
+  require('dashboard.github').fetch_review_threads(m.pr.repo, m.pr.number, function(threads, err)
+    if not threads then
+      handle.set_error(err or 'failed to fetch threads')
+      return
+    end
+    handle.set_content(format_review_threads(threads, m.pr.repo .. '#' .. m.pr.number))
+  end)
+end
+
 function M.diff_under_cursor()
   local m = under_cursor()
   if not m or not m.pr then
@@ -776,13 +841,11 @@ function M.diff_under_cursor()
   end)
 end
 
-local function open_result_window(title, content, on_reprompt)
+function open_result_window(title, on_reprompt, loading_text)
+  loading_text = loading_text or 'Loading…'
   local buf = vim.api.nvim_create_buf(false, true)
-  local lines = vim.split(content, '\n', { plain = true })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].filetype = 'markdown'
   vim.bo[buf].buftype = 'nofile'
-  vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = 'wipe'
 
   local width = math.min(110, math.floor(vim.o.columns * 0.75))
@@ -805,7 +868,47 @@ local function open_result_window(title, content, on_reprompt)
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
 
+  local frames = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+  local frame_i = 1
+  local timer = vim.uv.new_timer()
+  local stopped = false
+  local function stop_spinner()
+    if stopped then
+      return
+    end
+    stopped = true
+    timer:stop()
+    timer:close()
+  end
+
+  local function set_lines(text_lines)
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    vim.bo[buf].modifiable = true
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, text_lines)
+    vim.bo[buf].modifiable = false
+  end
+
+  set_lines { '', '  ⠋  ' .. loading_text, '' }
+
+  timer:start(
+    80,
+    80,
+    vim.schedule_wrap(function()
+      if stopped or not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_win_is_valid(win) then
+        stop_spinner()
+        return
+      end
+      vim.bo[buf].modifiable = true
+      pcall(vim.api.nvim_buf_set_lines, buf, 1, 2, false, { '  ' .. frames[frame_i] .. '  ' .. loading_text })
+      vim.bo[buf].modifiable = false
+      frame_i = (frame_i % #frames) + 1
+    end)
+  )
+
   local close = function()
+    stop_spinner()
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
@@ -813,39 +916,66 @@ local function open_result_window(title, content, on_reprompt)
   local opts = { buffer = buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, opts)
   vim.keymap.set('n', '<Esc>', close, opts)
-  if on_reprompt then
-    vim.keymap.set('n', '1', function()
-      close()
-      on_reprompt 'summary'
-    end, opts)
-    vim.keymap.set('n', '2', function()
-      close()
-      on_reprompt 'understand'
-    end, opts)
-    vim.keymap.set('n', '3', function()
-      close()
-      on_reprompt 'risks'
-    end, opts)
-    vim.keymap.set('n', '4', function()
-      close()
-      on_reprompt 'next_step'
-    end, opts)
+
+  local function set_content(text)
+    stop_spinner()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    set_lines(vim.split(text, '\n', { plain = true }))
+    if on_reprompt then
+      vim.keymap.set('n', '1', function()
+        close()
+        on_reprompt 'summary'
+      end, opts)
+      vim.keymap.set('n', '2', function()
+        close()
+        on_reprompt 'understand'
+      end, opts)
+      vim.keymap.set('n', '3', function()
+        close()
+        on_reprompt 'risks'
+      end, opts)
+      vim.keymap.set('n', '4', function()
+        close()
+        on_reprompt 'next_step'
+      end, opts)
+    end
   end
+
+  local function set_error(msg)
+    stop_spinner()
+    set_lines { '', '  ✗  ' .. (msg or 'unknown error'), '' }
+  end
+
+  return { set_content = set_content, set_error = set_error, close = close }
+end
+
+local function row_id(meta)
+  if meta.kind == 'pr' and meta.pr then
+    return meta.pr.repo .. '#' .. meta.pr.number
+  end
+  if meta.kind == 'jira' and meta.key then
+    return meta.key
+  end
+  return '?'
 end
 
 local function run_claude(meta, prompt_key)
   local claude = require 'dashboard.claude'
-  vim.notify('Asking Claude (' .. prompt_key .. ')…', vim.log.levels.INFO)
+  local prompts_tbl = claude.prompts()
+  local label = (prompts_tbl[prompt_key] and prompts_tbl[prompt_key].label) or prompt_key
+  local title = string.format('%s · %s', label, row_id(meta))
+  local handle = open_result_window(title, function(next_key)
+    run_claude(meta, next_key)
+  end, 'Asking Claude…')
   claude.analyze(meta, prompt_key, function(result, err)
     if not result then
-      vim.notify('Claude error: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      handle.set_error(err or 'unknown')
       return
     end
-    local title = string.format('%s · %s', result.label, result.ctx_id or '?')
     local footer = '\n\n— 1 summary · 2 understand · 3 risks · 4 next · q close'
-    open_result_window(title, result.text .. footer, function(next_key)
-      run_claude(meta, next_key)
-    end)
+    handle.set_content(result.text .. footer)
   end)
 end
 
@@ -994,13 +1124,14 @@ function M.open()
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
+  vim.keymap.set('n', 't', M.threads_under_cursor, opts)
   vim.keymap.set('n', 'x', M.mark_read_under_cursor, opts)
   vim.keymap.set('n', 's', function()
     M.analyze_under_cursor 'summary'
   end, opts)
   vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
 
-  vim.api.nvim_create_autocmd({ 'BufEnter', 'FocusGained' }, {
+  vim.api.nvim_create_autocmd('FocusGained', {
     buffer = state.buf,
     callback = function()
       if state.last_refresh and (os.time() - state.last_refresh) > config.refresh_after then

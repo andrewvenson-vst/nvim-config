@@ -13,8 +13,7 @@ query {
         updatedAt
         repository { nameWithOwner }
         reviewDecision
-        latestReviews(first: 20) { nodes { state author { login } submittedAt } }
-        comments(last: 1) { totalCount nodes { author { login } createdAt } }
+        latestReviews(first: 20) { nodes { state } }
         reviewThreads(first: 100) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
@@ -30,8 +29,7 @@ query {
         updatedAt
         repository { nameWithOwner }
         reviewDecision
-        latestReviews(first: 20) { nodes { state author { login } submittedAt } }
-        comments(last: 1) { totalCount nodes { author { login } createdAt } }
+        latestReviews(first: 20) { nodes { state } }
         reviewThreads(first: 100) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
@@ -49,30 +47,10 @@ local function flatten(nodes)
       rollup = commits[1].commit.statusCheckRollup.state
     end
     local approvals = 0
-    local last_review_at, last_review_author
-    local latest = (n.latestReviews and n.latestReviews.nodes) or {}
-    for _, r in ipairs(latest) do
+    for _, r in ipairs((n.latestReviews and n.latestReviews.nodes) or {}) do
       if r.state == 'APPROVED' then
         approvals = approvals + 1
       end
-      if r.submittedAt and (not last_review_at or r.submittedAt > last_review_at) then
-        last_review_at = r.submittedAt
-        last_review_author = r.author and r.author.login
-      end
-    end
-
-    local last_comment_at, last_comment_author
-    local cnodes = (n.comments and n.comments.nodes) or {}
-    if cnodes[1] then
-      last_comment_at = cnodes[1].createdAt
-      last_comment_author = cnodes[1].author and cnodes[1].author.login
-    end
-
-    local last_activity_at, last_activity_author
-    if last_comment_at and (not last_review_at or last_comment_at > last_review_at) then
-      last_activity_at, last_activity_author = last_comment_at, last_comment_author
-    elseif last_review_at then
-      last_activity_at, last_activity_author = last_review_at, last_review_author
     end
 
     local unresolved = 0
@@ -93,8 +71,6 @@ local function flatten(nodes)
       reviewDecision = n.reviewDecision,
       approvalCount = approvals,
       ciStatus = rollup,
-      lastActivityAt = last_activity_at,
-      lastActivityAuthor = last_activity_author,
       unresolvedThreads = unresolved,
     })
   end
@@ -122,6 +98,72 @@ function M.fetch_prs(callback)
         my_prs = flatten(data.mine and data.mine.nodes),
         reviews = flatten(data.reviews and data.reviews.nodes),
       }
+    end)
+  end)
+end
+
+local THREADS_QUERY = [[
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(first: 50) {
+            nodes {
+              author { login }
+              createdAt
+              body
+              diffHunk
+            }
+          }
+        }
+      }
+    }
+  }
+}
+]]
+
+function M.fetch_review_threads(repo, number, callback)
+  local owner, name = repo:match '^([^/]+)/(.+)$'
+  if not owner then
+    callback(nil, 'invalid repo: ' .. tostring(repo))
+    return
+  end
+  vim.system({
+    'gh',
+    'api',
+    'graphql',
+    '-f',
+    'query=' .. THREADS_QUERY,
+    '-F',
+    'owner=' .. owner,
+    '-F',
+    'repo=' .. name,
+    '-F',
+    'number=' .. tostring(number),
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' then
+        callback(nil, 'json parse error')
+        return
+      end
+      if parsed.errors then
+        callback(nil, (parsed.errors[1] and parsed.errors[1].message) or 'graphql error')
+        return
+      end
+      local pr = parsed.data and parsed.data.repository and parsed.data.repository.pullRequest
+      local nodes = (pr and pr.reviewThreads and pr.reviewThreads.nodes) or {}
+      callback(nodes)
     end)
   end)
 end
