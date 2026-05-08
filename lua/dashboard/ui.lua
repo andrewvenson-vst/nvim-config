@@ -18,6 +18,112 @@ local pending_hls = {}
 local PAD = '   '
 local BAR = '┃'
 
+local config = {
+  repo_paths = {},
+  refresh_after = 60,
+  jira_status_order = {
+    'In Progress',
+    'Peer Review',
+    'Needs QA',
+    'In QA',
+    'Passed QA',
+    'Refinement',
+  },
+}
+
+function M.setup(opts)
+  opts = opts or {}
+  if opts.repo_paths then
+    config.repo_paths = opts.repo_paths
+  end
+  if opts.refresh_after then
+    config.refresh_after = opts.refresh_after
+  end
+  if opts.jira_status_order then
+    config.jira_status_order = opts.jira_status_order
+  end
+end
+
+local function in_tmux()
+  return vim.env.TMUX ~= nil and vim.env.TMUX ~= ''
+end
+
+local function repo_from_url(url)
+  if not url then
+    return nil
+  end
+  return url:match 'github%.com/([^/]+/[^/]+)'
+end
+
+local function relative_time(iso)
+  if not iso then
+    return '', 'NonText'
+  end
+  local y, mo, d, h, mi, s = iso:match '(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)'
+  if not y then
+    return '', 'NonText'
+  end
+  local utc_table = {
+    year = tonumber(y),
+    month = tonumber(mo),
+    day = tonumber(d),
+    hour = tonumber(h),
+    min = tonumber(mi),
+    sec = tonumber(s),
+  }
+  local as_local = os.time(utc_table)
+  local now = os.time()
+  local tz_offset = os.difftime(now, os.time(os.date '!*t'))
+  local epoch = as_local + tz_offset
+  local diff = now - epoch
+  local label
+  if diff < 60 then
+    label = 'now'
+  elseif diff < 3600 then
+    label = string.format('%dm', math.floor(diff / 60))
+  elseif diff < 86400 then
+    label = string.format('%dh', math.floor(diff / 3600))
+  elseif diff < 7 * 86400 then
+    label = string.format('%dd', math.floor(diff / 86400))
+  elseif diff < 30 * 86400 then
+    label = string.format('%dd', math.floor(diff / 86400))
+  elseif diff < 365 * 86400 then
+    label = string.format('%dmo', math.floor(diff / (30 * 86400)))
+  else
+    label = string.format('%dy', math.floor(diff / (365 * 86400)))
+  end
+  local hl
+  if diff < 7 * 86400 then
+    hl = 'NonText'
+  elseif diff < 30 * 86400 then
+    hl = 'DiagnosticWarn'
+  else
+    hl = 'DiagnosticError'
+  end
+  return label, hl
+end
+
+local NOTIFICATION_REASON = {
+  mention = { label = '@mention', hl = 'DiagnosticInfo' },
+  team_mention = { label = 'team @', hl = 'DiagnosticInfo' },
+  review_requested = { label = 'review', hl = '@keyword' },
+  assign = { label = 'assign', hl = '@keyword' },
+  author = { label = 'author', hl = 'Comment' },
+  comment = { label = 'comment', hl = 'Comment' },
+  subscribed = { label = 'watching', hl = 'NonText' },
+  state_change = { label = 'state', hl = 'NonText' },
+  security_alert = { label = 'security', hl = 'DiagnosticError' },
+  ci_activity = { label = 'ci', hl = 'DiagnosticWarn' },
+}
+
+local function notification_reason(reason)
+  local entry = NOTIFICATION_REASON[reason]
+  if entry then
+    return entry.label, entry.hl
+  end
+  return reason or '?', 'Comment'
+end
+
 local function buf_valid()
   return state.buf and vim.api.nvim_buf_is_valid(state.buf)
 end
@@ -184,12 +290,16 @@ local function ci_badge(status)
   return '·', 'NonText'
 end
 
-local function review_badge(decision)
-  if decision == 'APPROVED' then
-    return '✓', 'DiagnosticOk'
-  end
+local function review_badge(decision, approvals)
   if decision == 'CHANGES_REQUESTED' then
     return '✗', 'DiagnosticError'
+  end
+  approvals = approvals or 0
+  if approvals >= 2 then
+    return '✓', 'DiagnosticOk'
+  end
+  if approvals == 1 then
+    return '◐', 'DiagnosticWarn'
   end
   if decision == 'REVIEW_REQUIRED' then
     return '○', 'DiagnosticWarn'
@@ -222,7 +332,8 @@ local function emit_pr(lines, meta, pr, opts)
   local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
   local num = '#' .. tostring(pr.number)
   local ci_glyph, ci_hl = ci_badge(pr.ciStatus)
-  local rv_glyph, rv_hl = review_badge(pr.reviewDecision)
+  local rv_glyph, rv_hl = review_badge(pr.reviewDecision, pr.approvalCount)
+  local age_label, age_hl = relative_time(pr.updatedAt)
   local segments = {
     { text = PAD, hl = nil },
     { text = BAR .. ' ', hl = 'NonText' },
@@ -232,6 +343,8 @@ local function emit_pr(lines, meta, pr, opts)
     { text = rv_glyph, hl = rv_hl },
     { text = '  ', hl = nil },
     { text = pad_right(repo, 30), hl = '@string' },
+    { text = string.format('%5s', age_label), hl = age_hl },
+    { text = '  ', hl = nil },
     { text = pr.title, hl = 'Normal' },
   }
   if opts.draft and pr.isDraft then
@@ -239,7 +352,7 @@ local function emit_pr(lines, meta, pr, opts)
   end
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
-  meta[idx + 1] = { url = pr.url }
+  meta[idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo } }
 end
 
 local function emit_issue(lines, meta, issue, opts)
@@ -268,8 +381,32 @@ local function emit_issue(lines, meta, issue, opts)
       { text = pr.title or '', hl = 'Comment' },
     })
     paint(sub_idx, sub_cols)
-    meta[sub_idx + 1] = { url = pr.url }
+    meta[sub_idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo } }
   end
+end
+
+local function emit_notification(lines, meta, n)
+  local label, hl = notification_reason(n.reason)
+  local age_label, age_hl = relative_time(n.updated_at)
+  local idx, cols = emit(lines, {
+    { text = PAD, hl = nil },
+    { text = BAR .. ' ', hl = 'NonText' },
+    { text = pad_right(n.repo or '?', 30), hl = '@string' },
+    { text = pad_right(label, 12), hl = hl },
+    { text = string.format('%5s', age_label), hl = age_hl },
+    { text = '  ', hl = nil },
+    { text = n.title or '', hl = 'Normal' },
+  })
+  paint(idx, cols)
+  local pr_meta = nil
+  if n.type == 'PullRequest' then
+    local repo = repo_from_url(n.url)
+    local pr_num = n.url and tonumber(n.url:match '/pull/(%d+)$') or nil
+    if repo and pr_num then
+      pr_meta = { number = pr_num, repo = repo }
+    end
+  end
+  meta[idx + 1] = { url = n.url, pr = pr_meta }
 end
 
 local function emit_section(lines, meta, title, items, emit_item, empty_label)
@@ -298,7 +435,7 @@ local function emit_header(lines)
   })
   paint(idx, cols)
 
-  local hint = '  <CR> open · y yank · r refresh · q close   │   PR cols: CI · Review   ✓ ok  ✗ fail  ● pending  ○ awaiting'
+  local hint = '  <CR> open · y yank · c checkout · D diff · r refresh · q close   │   review: ✓ 2+ approved  ◐ 1 approved  ○ none  ✗ changes'
   local idx2, cols2 = emit(lines, {
     { text = hint, hl = 'Comment' },
   })
@@ -342,14 +479,50 @@ local function render()
     emit_pr(ls, m, pr)
   end, 'Inbox zero')
 
+  emit_divider(lines, 'Notifications')
+  emit_blank(lines)
+  emit_section(lines, meta, 'Inbox', state.data.notifications, function(ls, m, n)
+    emit_notification(ls, m, n)
+  end, 'No notifications')
+
   emit_divider(lines, 'Jira')
   emit_blank(lines)
-  emit_section(lines, meta, 'In Progress', state.data.jira_in_progress, function(ls, m, issue)
-    emit_issue(ls, m, issue, { pr_pool = pr_pool })
-  end, 'No tickets in progress')
-  emit_section(lines, meta, 'Other assigned', state.data.jira_assigned, function(ls, m, issue)
-    emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
-  end, 'Nothing else assigned')
+  local active = state.data.jira_active
+  if active == nil then
+    emit_section(lines, meta, 'Active', nil, function() end, '')
+  elseif active == false or type(active) == 'string' then
+    emit_section(lines, meta, 'Active', active, function() end, '')
+  else
+    local groups = {}
+    for _, issue in ipairs(active) do
+      local s = issue.status or 'Unknown'
+      groups[s] = groups[s] or {}
+      table.insert(groups[s], issue)
+    end
+    local seen = {}
+    for _, status in ipairs(config.jira_status_order) do
+      seen[status] = true
+      local items = groups[status]
+      if items and #items > 0 then
+        emit_section(lines, meta, status, items, function(ls, m, issue)
+          emit_issue(ls, m, issue, { pr_pool = pr_pool })
+        end, '')
+      end
+    end
+    local other = {}
+    for status, issues in pairs(groups) do
+      if not seen[status] then
+        for _, issue in ipairs(issues) do
+          table.insert(other, issue)
+        end
+      end
+    end
+    if #other > 0 then
+      emit_section(lines, meta, 'Other', other, function(ls, m, issue)
+        emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
+      end, '')
+    end
+  end
 
   emit_footer(lines)
 
@@ -375,6 +548,52 @@ function M.open_under_cursor()
   end
 end
 
+local function tmux_run(args, cwd)
+  local cmd = { 'tmux', 'split-window', '-h' }
+  if cwd then
+    table.insert(cmd, '-c')
+    table.insert(cmd, cwd)
+  end
+  for _, a in ipairs(args) do
+    table.insert(cmd, a)
+  end
+  vim.system(cmd)
+end
+
+function M.checkout_under_cursor()
+  local m = under_cursor()
+  if not m or not m.pr then
+    return
+  end
+  if not in_tmux() then
+    vim.notify('Not in a tmux session', vim.log.levels.WARN)
+    return
+  end
+  local repo_path = config.repo_paths[m.pr.repo]
+  if not repo_path then
+    vim.notify('No local path configured for ' .. m.pr.repo, vim.log.levels.WARN)
+    return
+  end
+  repo_path = vim.fn.expand(repo_path)
+  local shell = vim.env.SHELL or '/bin/sh'
+  local cmd_str = string.format('gh pr checkout %d; exec %s', m.pr.number, shell)
+  tmux_run({ cmd_str }, repo_path)
+end
+
+function M.diff_under_cursor()
+  local m = under_cursor()
+  if not m or not m.pr then
+    return
+  end
+  if not in_tmux() then
+    vim.notify('Not in a tmux session', vim.log.levels.WARN)
+    return
+  end
+  local shell = vim.env.SHELL or '/bin/sh'
+  local cmd_str = string.format('gh pr diff %s | less -R; exec %s', vim.fn.shellescape(m.url), shell)
+  tmux_run { cmd_str }
+end
+
 function M.yank_under_cursor()
   local m = under_cursor()
   if m and m.url then
@@ -396,8 +615,8 @@ function M.refresh()
   state.data = {
     my_prs = nil,
     reviews = nil,
-    jira_in_progress = nil,
-    jira_assigned = nil,
+    notifications = nil,
+    jira_active = nil,
   }
   render()
 
@@ -424,8 +643,8 @@ function M.refresh()
     state.last_refresh = os.time()
     render()
   end)
-  jira.in_progress(update 'jira_in_progress')
-  jira.assigned(update 'jira_assigned')
+  github.fetch_notifications(update 'notifications')
+  jira.assigned_active(update 'jira_active')
 end
 
 function M.open()
@@ -438,13 +657,15 @@ function M.open()
   vim.bo[state.buf].bufhidden = 'wipe'
   vim.bo[state.buf].filetype = 'dashboard'
 
-  local width = math.min(110, math.floor(vim.o.columns * 0.85))
+  local width = math.min(140, math.floor(vim.o.columns * 0.9))
   local height = math.min(44, math.floor(vim.o.lines * 0.85))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local available = vim.o.lines - vim.o.cmdheight - statusline
   state.win = vim.api.nvim_open_win(state.buf, true, {
     relative = 'editor',
     width = width,
     height = height,
-    row = math.floor((vim.o.lines - height) / 2),
+    row = math.floor((available - height) / 2),
     col = math.floor((vim.o.columns - width) / 2),
     style = 'minimal',
     border = 'rounded',
@@ -463,6 +684,17 @@ function M.open()
   vim.keymap.set('n', 'r', M.refresh, opts)
   vim.keymap.set('n', '<CR>', M.open_under_cursor, opts)
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
+  vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
+  vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
+
+  vim.api.nvim_create_autocmd({ 'BufEnter', 'FocusGained' }, {
+    buffer = state.buf,
+    callback = function()
+      if state.last_refresh and (os.time() - state.last_refresh) > config.refresh_after then
+        M.refresh()
+      end
+    end,
+  })
 
   M.refresh()
 end

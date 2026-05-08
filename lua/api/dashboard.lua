@@ -1,1 +1,20 @@
-require('dashboard').setup()
+require('dashboard').setup {
+  -- Used by `c` (checkout PR in tmux pane) on a PR row.
+  repo_paths = {
+    ['vitalsource/business-center'] = '~/projects/business-center',
+    ['vitalsource/cobra-skills'] = '~/projects/cobra-skills',
+    ['vitalsource/compete'] = '~/projects/compete',
+    ['vitalsource/connect'] = '~/projects/connect',
+    ['vitalsource/docker-build'] = '~/projects/docker-build',
+    ['vitalsource/doorman'] = '~/projects/doorman',
+    ['vitalsource/jiffy'] = '~/projects/jiffy',
+    ['vitalsource/jigsaw'] = '~/projects/jigsaw',
+    ['vitalsource/nsync'] = '~/projects/nsync',
+    ['vitalsource/program-orders'] = '~/projects/program-orders',
+    ['vitalsource/syllabus'] = '~/projects/syllabus',
+    ['vitalsource/verba-docs'] = '~/projects/verba-docs',
+    ['vitalsource/vrse'] = '~/projects/vrse',
+    ['vitalsource/vst-external'] = '~/projects/vst-external',
+    ['vitalsource/vst-utils'] = '~/projects/vst-utils',
+  },
+}

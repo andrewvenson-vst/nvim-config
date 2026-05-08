@@ -82,15 +82,8 @@ local function search(jql, callback)
   end)
 end
 
-function M.in_progress(callback)
-  search('assignee = currentUser() AND status = "In Progress" ORDER BY updated DESC', callback)
-end
-
-function M.assigned(callback)
-  search(
-    'assignee = currentUser() AND statusCategory != Done AND status != "In Progress" ORDER BY updated DESC',
-    callback
-  )
+function M.assigned_active(callback)
+  search('assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
 end
 
 return M
