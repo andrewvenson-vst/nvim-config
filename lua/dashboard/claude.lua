@@ -32,9 +32,25 @@ local PROMPTS = {
     label = 'Next step',
     instruction = 'Read the state and tell me the most useful next action for me as the assignee/author/reviewer. One short paragraph or 2-3 bullets, no more. Be concrete (e.g. "fix CI on commit X", "reply to <reviewer>\'s comment about Y", "move to In QA"). No preamble.',
   },
+  code_review = {
+    label = 'Code review',
+    instruction = [[Review this PR as a senior engineer. Be direct and specific. Cite file:line where possible.
+
+Structure your review as:
+
+**Blocking** — must fix before merge (correctness bugs, security, breaking changes, data loss, broken contracts). Propose a concrete fix.
+
+**Should fix** — worth addressing now (maintainability, missing tests, performance, API design, error handling, race conditions).
+
+**Nits** — minor style or preference; safe to skip.
+
+**LGTM if** — what conditions would make you approve as-is.
+
+Skip what is obvious from the diff. If the PR is small or simple, your review should be too. If you would approve outright, say so briefly and explain why. If this is not a PR with a diff, say so and stop. No preamble.]],
+  },
 }
 
-local PROMPT_ORDER = { 'summary', 'understand', 'risks', 'next_step' }
+local PROMPT_ORDER = { 'summary', 'understand', 'risks', 'next_step', 'code_review' }
 
 function M.prompts()
   return PROMPTS, PROMPT_ORDER

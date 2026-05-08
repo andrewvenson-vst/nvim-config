@@ -924,22 +924,15 @@ function open_result_window(title, on_reprompt, loading_text)
     end
     set_lines(vim.split(text, '\n', { plain = true }))
     if on_reprompt then
-      vim.keymap.set('n', '1', function()
-        close()
-        on_reprompt 'summary'
-      end, opts)
-      vim.keymap.set('n', '2', function()
-        close()
-        on_reprompt 'understand'
-      end, opts)
-      vim.keymap.set('n', '3', function()
-        close()
-        on_reprompt 'risks'
-      end, opts)
-      vim.keymap.set('n', '4', function()
-        close()
-        on_reprompt 'next_step'
-      end, opts)
+      local _, order = require('dashboard.claude').prompts()
+      for i, key in ipairs(order) do
+        if i <= 9 then
+          vim.keymap.set('n', tostring(i), function()
+            close()
+            on_reprompt(key)
+          end, opts)
+        end
+      end
     end
   end
 
@@ -974,7 +967,12 @@ local function run_claude(meta, prompt_key)
       handle.set_error(err or 'unknown')
       return
     end
-    local footer = '\n\n— 1 summary · 2 understand · 3 risks · 4 next · q close'
+    local prompts_tbl, order = claude.prompts()
+    local hints = {}
+    for i, key in ipairs(order) do
+      table.insert(hints, string.format('%d %s', i, (prompts_tbl[key].label or key):lower()))
+    end
+    local footer = '\n\n— ' .. table.concat(hints, ' · ') .. ' · q close'
     handle.set_content(result.text .. footer)
   end)
 end
@@ -1095,7 +1093,7 @@ function M.open()
   vim.bo[state.buf].bufhidden = 'wipe'
   vim.bo[state.buf].filetype = 'dashboard'
 
-  local width = math.min(140, math.floor(vim.o.columns * 0.9))
+  local width = math.min(155, math.floor(vim.o.columns * 0.92))
   local height = math.min(44, math.floor(vim.o.lines * 0.85))
   local statusline = vim.o.laststatus > 0 and 1 or 0
   local available = vim.o.lines - vim.o.cmdheight - statusline
