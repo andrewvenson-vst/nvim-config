@@ -11,6 +11,7 @@ local state = {
   line_meta = {},
   data = {},
   last_refresh = nil,
+  filter = nil,
 }
 
 local pending_hls = {}
@@ -207,6 +208,58 @@ local function pad_right(s, n)
     return s:sub(1, n - 1) .. '…'
   end
   return s .. string.rep(' ', n - #s)
+end
+
+local function matches_filter(text, filter)
+  if not filter or filter == '' then
+    return true
+  end
+  if not text or text == '' then
+    return false
+  end
+  return tostring(text):lower():find(filter:lower(), 1, true) ~= nil
+end
+
+local function pr_matches(pr, filter)
+  if not filter or filter == '' then
+    return true
+  end
+  return matches_filter(pr.title, filter)
+    or matches_filter(pr.body, filter)
+    or matches_filter('#' .. tostring(pr.number), filter)
+    or matches_filter(pr.repository and pr.repository.nameWithOwner or '', filter)
+end
+
+local function issue_matches(issue, filter)
+  if not filter or filter == '' then
+    return true
+  end
+  return matches_filter(issue.key, filter)
+    or matches_filter(issue.summary, filter)
+    or matches_filter(issue.qa_assignee, filter)
+    or matches_filter(issue.status, filter)
+end
+
+local function notification_matches(n, filter)
+  if not filter or filter == '' then
+    return true
+  end
+  return matches_filter(n.title, filter)
+    or matches_filter(n.repo, filter)
+    or matches_filter(n.reason, filter)
+end
+
+local function filter_list(items, predicate)
+  if type(items) ~= 'table' or not predicate then
+    return items
+  end
+  local out = {}
+  for _, it in ipairs(items) do
+    if predicate(it) then
+      table.insert(out, it)
+    end
+  end
+  return out
 end
 
 local function sort_prs_by_repo(prs)
@@ -490,12 +543,23 @@ local function emit_header(lines)
     { text = ' open · ', hl = 'Comment' },
     { text = 'y', hl = '@keyword' },
     { text = ' yank · ', hl = 'Comment' },
+    { text = 'f', hl = '@keyword' },
+    { text = ' filter · ', hl = 'Comment' },
     { text = 'r', hl = '@keyword' },
     { text = ' refresh · ', hl = 'Comment' },
     { text = 'q', hl = '@keyword' },
     { text = ' close', hl = 'Comment' },
     CLOSE_BR,
   })
+  if state.filter and state.filter ~= '' then
+    emit_legend(lines, {
+      { text = 'Filter: ', hl = 'Comment' },
+      { text = state.filter, hl = '@string' },
+      { text = '   (', hl = 'Comment' },
+      { text = 'f', hl = '@keyword' },
+      { text = ' edit · empty to clear)', hl = 'Comment' },
+    })
+  end
   emit_blank(lines)
 end
 
@@ -584,28 +648,48 @@ local function render()
   sort_prs_by_repo(state.data.reviews)
   local pr_pool = all_known_prs()
 
+  local f = state.filter
+  local function maybe_filter(items, pred)
+    if not f or f == '' then
+      return items
+    end
+    return filter_list(items, pred)
+  end
+  local my_prs = maybe_filter(state.data.my_prs, function(p)
+    return pr_matches(p, f)
+  end)
+  local reviews = maybe_filter(state.data.reviews, function(p)
+    return pr_matches(p, f)
+  end)
+  local notifications = maybe_filter(state.data.notifications, function(n)
+    return notification_matches(n, f)
+  end)
+  local jira_active = maybe_filter(state.data.jira_active, function(i)
+    return issue_matches(i, f)
+  end)
+
   emit_header(lines)
   emit_divider(lines, 'GitHub')
   emit_github_legend(lines)
   emit_blank(lines)
-  emit_section(lines, meta, 'My PRs', state.data.my_prs, function(ls, m, pr)
+  emit_section(lines, meta, 'My PRs', my_prs, function(ls, m, pr)
     emit_pr(ls, m, pr, { draft = true })
   end, 'No open PRs')
-  emit_section(lines, meta, 'Awaiting my review', state.data.reviews, function(ls, m, pr)
+  emit_section(lines, meta, 'Awaiting my review', reviews, function(ls, m, pr)
     emit_pr(ls, m, pr)
   end, 'Inbox zero')
 
   emit_divider(lines, 'Notifications')
   emit_notifications_legend(lines)
   emit_blank(lines)
-  emit_section(lines, meta, 'Inbox', state.data.notifications, function(ls, m, n)
+  emit_section(lines, meta, 'Inbox', notifications, function(ls, m, n)
     emit_notification(ls, m, n)
   end, 'No notifications')
 
   emit_divider(lines, 'Jira')
   emit_jira_legend(lines)
   emit_blank(lines)
-  local active = state.data.jira_active
+  local active = jira_active
   if active == nil then
     emit_section(lines, meta, 'Active', nil, function() end, '')
   elseif active == false or type(active) == 'string' then
@@ -1047,6 +1131,18 @@ function M.close()
   state.line_meta = {}
 end
 
+function M.filter_prompt()
+  vim.ui.input({ prompt = 'Filter: ', default = state.filter or '' }, function(input)
+    if input == nil then
+      return
+    end
+    state.filter = (input ~= '' and input) or nil
+    if buf_valid() then
+      render()
+    end
+  end)
+end
+
 function M.refresh()
   state.data = {
     my_prs = nil,
@@ -1128,6 +1224,7 @@ function M.open()
     M.analyze_under_cursor 'summary'
   end, opts)
   vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
+  vim.keymap.set('n', 'f', M.filter_prompt, opts)
 
   vim.api.nvim_create_autocmd('FocusGained', {
     buffer = state.buf,
