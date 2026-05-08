@@ -3,6 +3,7 @@ local M = {}
 function M.setup(opts)
   opts = opts or {}
   require('dashboard.jira').setup(opts.jira)
+  require('dashboard.claude').setup(opts.claude)
   require('dashboard.ui').setup {
     repo_paths = opts.repo_paths,
     refresh_after = opts.refresh_after,

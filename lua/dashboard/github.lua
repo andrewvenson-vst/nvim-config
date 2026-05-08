@@ -13,7 +13,9 @@ query {
         updatedAt
         repository { nameWithOwner }
         reviewDecision
-        latestReviews(first: 20) { nodes { state } }
+        latestReviews(first: 20) { nodes { state author { login } submittedAt } }
+        comments(last: 1) { totalCount nodes { author { login } createdAt } }
+        reviewThreads(first: 100) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -28,7 +30,9 @@ query {
         updatedAt
         repository { nameWithOwner }
         reviewDecision
-        latestReviews(first: 20) { nodes { state } }
+        latestReviews(first: 20) { nodes { state author { login } submittedAt } }
+        comments(last: 1) { totalCount nodes { author { login } createdAt } }
+        reviewThreads(first: 100) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -45,12 +49,39 @@ local function flatten(nodes)
       rollup = commits[1].commit.statusCheckRollup.state
     end
     local approvals = 0
+    local last_review_at, last_review_author
     local latest = (n.latestReviews and n.latestReviews.nodes) or {}
     for _, r in ipairs(latest) do
       if r.state == 'APPROVED' then
         approvals = approvals + 1
       end
+      if r.submittedAt and (not last_review_at or r.submittedAt > last_review_at) then
+        last_review_at = r.submittedAt
+        last_review_author = r.author and r.author.login
+      end
     end
+
+    local last_comment_at, last_comment_author
+    local cnodes = (n.comments and n.comments.nodes) or {}
+    if cnodes[1] then
+      last_comment_at = cnodes[1].createdAt
+      last_comment_author = cnodes[1].author and cnodes[1].author.login
+    end
+
+    local last_activity_at, last_activity_author
+    if last_comment_at and (not last_review_at or last_comment_at > last_review_at) then
+      last_activity_at, last_activity_author = last_comment_at, last_comment_author
+    elseif last_review_at then
+      last_activity_at, last_activity_author = last_review_at, last_review_author
+    end
+
+    local unresolved = 0
+    for _, t in ipairs((n.reviewThreads and n.reviewThreads.nodes) or {}) do
+      if not t.isResolved then
+        unresolved = unresolved + 1
+      end
+    end
+
     table.insert(out, {
       number = n.number,
       title = n.title,
@@ -62,6 +93,9 @@ local function flatten(nodes)
       reviewDecision = n.reviewDecision,
       approvalCount = approvals,
       ciStatus = rollup,
+      lastActivityAt = last_activity_at,
+      lastActivityAuthor = last_activity_author,
+      unresolvedThreads = unresolved,
     })
   end
   return out

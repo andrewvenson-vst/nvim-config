@@ -352,7 +352,28 @@ local function emit_pr(lines, meta, pr, opts)
   end
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
-  meta[idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo } }
+  meta[idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo }, kind = 'pr' }
+
+  local sub = { { text = '       ┊ ', hl = 'NonText' } }
+  local has_meta = false
+  if pr.lastActivityAt and pr.lastActivityAuthor then
+    table.insert(sub, { text = pr.lastActivityAuthor, hl = 'Comment' })
+    table.insert(sub, { text = ' ', hl = nil })
+    local age, age_hl = relative_time(pr.lastActivityAt)
+    table.insert(sub, { text = age, hl = age_hl })
+    has_meta = true
+  end
+  if pr.unresolvedThreads and pr.unresolvedThreads > 0 then
+    if has_meta then
+      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
+    end
+    table.insert(sub, { text = tostring(pr.unresolvedThreads) .. ' unresolved', hl = 'DiagnosticWarn' })
+    has_meta = true
+  end
+  if has_meta then
+    local sidx, scols = emit(lines, sub)
+    paint(sidx, scols)
+  end
 end
 
 local function emit_issue(lines, meta, issue, opts)
@@ -369,7 +390,39 @@ local function emit_issue(lines, meta, issue, opts)
   table.insert(segments, { text = issue.summary or '', hl = 'Normal' })
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
-  meta[idx + 1] = { url = issue.url }
+  meta[idx + 1] = { url = issue.url, kind = 'jira', key = issue.key }
+
+  local sub = { { text = '       ┊ ', hl = 'NonText' } }
+  local has_meta = false
+  if issue.qa_assignee then
+    table.insert(sub, { text = 'QA: ', hl = 'Comment' })
+    table.insert(sub, { text = issue.qa_assignee, hl = '@string' })
+    has_meta = true
+  end
+  if issue.last_comment_at and issue.last_comment_author then
+    if has_meta then
+      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
+    end
+    table.insert(sub, { text = 'last: ', hl = 'Comment' })
+    table.insert(sub, { text = issue.last_comment_author, hl = 'Comment' })
+    table.insert(sub, { text = ' ', hl = nil })
+    local age, age_hl = relative_time(issue.last_comment_at)
+    table.insert(sub, { text = age, hl = age_hl })
+    has_meta = true
+  end
+  if issue.status_change_at then
+    if has_meta then
+      table.insert(sub, { text = '  ·  ', hl = 'NonText' })
+    end
+    local age, age_hl = relative_time(issue.status_change_at)
+    table.insert(sub, { text = 'in status ', hl = 'Comment' })
+    table.insert(sub, { text = age, hl = age_hl })
+    has_meta = true
+  end
+  if has_meta then
+    local sidx, scols = emit(lines, sub)
+    paint(sidx, scols)
+  end
 
   local matches = related_prs(issue.key, opts.pr_pool or {})
   for _, pr in ipairs(matches) do
@@ -381,7 +434,7 @@ local function emit_issue(lines, meta, issue, opts)
       { text = pr.title or '', hl = 'Comment' },
     })
     paint(sub_idx, sub_cols)
-    meta[sub_idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo } }
+    meta[sub_idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo }, kind = 'pr' }
   end
 end
 
@@ -406,7 +459,12 @@ local function emit_notification(lines, meta, n)
       pr_meta = { number = pr_num, repo = repo }
     end
   end
-  meta[idx + 1] = { url = n.url, pr = pr_meta }
+  meta[idx + 1] = {
+    url = n.url,
+    pr = pr_meta,
+    notification_id = n.id,
+    kind = pr_meta and 'pr' or nil,
+  }
 end
 
 local function emit_section(lines, meta, title, items, emit_item, empty_label)
@@ -428,19 +486,96 @@ local function emit_section(lines, meta, title, items, emit_item, empty_label)
   emit_blank(lines)
 end
 
-local function emit_header(lines)
-  local title = '  ★  Status Dashboard'
-  local idx, cols = emit(lines, {
-    { text = title, hl = 'Title' },
-  })
+local function emit_segments(lines, segments)
+  local idx, cols = emit(lines, segments)
   paint(idx, cols)
+  return idx
+end
 
-  local hint = '  <CR> open · y yank · c checkout · D diff · r refresh · q close   │   review: ✓ 2+ approved  ◐ 1 approved  ○ none  ✗ changes'
-  local idx2, cols2 = emit(lines, {
-    { text = hint, hl = 'Comment' },
+local function emit_legend(lines, segments)
+  local prefixed = { { text = '  ', hl = nil } }
+  for _, s in ipairs(segments) do
+    table.insert(prefixed, s)
+  end
+  emit_segments(lines, prefixed)
+end
+
+local function emit_header(lines)
+  emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
+  emit_legend(lines, {
+    OPEN_BR,
+    { text = '<CR>', hl = '@keyword' },
+    { text = ' open · ', hl = 'Comment' },
+    { text = 'y', hl = '@keyword' },
+    { text = ' yank · ', hl = 'Comment' },
+    { text = 'r', hl = '@keyword' },
+    { text = ' refresh · ', hl = 'Comment' },
+    { text = 'q', hl = '@keyword' },
+    { text = ' close', hl = 'Comment' },
+    CLOSE_BR,
   })
-  paint(idx2, cols2)
   emit_blank(lines)
+end
+
+local OPEN_BR = { text = '[ ', hl = 'NonText' }
+local CLOSE_BR = { text = ' ]', hl = 'NonText' }
+local GAP = { text = '   ', hl = nil }
+
+local function emit_github_legend(lines)
+  emit_legend(lines, {
+    OPEN_BR,
+    { text = 'CI: ', hl = 'Comment' },
+    { text = '✓', hl = 'DiagnosticOk' },
+    { text = ' pass · ', hl = 'Comment' },
+    { text = '✗', hl = 'DiagnosticError' },
+    { text = ' fail · ', hl = 'Comment' },
+    { text = '●', hl = 'DiagnosticWarn' },
+    { text = ' pending', hl = 'Comment' },
+    CLOSE_BR,
+    GAP,
+    OPEN_BR,
+    { text = 'Review: ', hl = 'Comment' },
+    { text = '✓', hl = 'DiagnosticOk' },
+    { text = ' 2+ · ', hl = 'Comment' },
+    { text = '◐', hl = 'DiagnosticWarn' },
+    { text = ' 1 · ', hl = 'Comment' },
+    { text = '○', hl = 'DiagnosticWarn' },
+    { text = ' 0 · ', hl = 'Comment' },
+    { text = '✗', hl = 'DiagnosticError' },
+    { text = ' changes', hl = 'Comment' },
+    CLOSE_BR,
+    GAP,
+    OPEN_BR,
+    { text = 'c', hl = '@keyword' },
+    { text = ' checkout · ', hl = 'Comment' },
+    { text = 'D', hl = '@keyword' },
+    { text = ' diff · ', hl = 'Comment' },
+    { text = 's', hl = '@keyword' },
+    { text = ' summary · ', hl = 'Comment' },
+    { text = '?', hl = '@keyword' },
+    { text = ' prompts', hl = 'Comment' },
+    CLOSE_BR,
+  })
+end
+
+local function emit_notifications_legend(lines)
+  emit_legend(lines, {
+    OPEN_BR,
+    { text = 'x', hl = '@keyword' },
+    { text = ' mark read', hl = 'Comment' },
+    CLOSE_BR,
+  })
+end
+
+local function emit_jira_legend(lines)
+  emit_legend(lines, {
+    OPEN_BR,
+    { text = 's', hl = '@keyword' },
+    { text = ' summary · ', hl = 'Comment' },
+    { text = '?', hl = '@keyword' },
+    { text = ' prompts', hl = 'Comment' },
+    CLOSE_BR,
+  })
 end
 
 local function emit_footer(lines)
@@ -471,6 +606,7 @@ local function render()
 
   emit_header(lines)
   emit_divider(lines, 'GitHub')
+  emit_github_legend(lines)
   emit_blank(lines)
   emit_section(lines, meta, 'My PRs', state.data.my_prs, function(ls, m, pr)
     emit_pr(ls, m, pr, { draft = true })
@@ -480,12 +616,14 @@ local function render()
   end, 'Inbox zero')
 
   emit_divider(lines, 'Notifications')
+  emit_notifications_legend(lines)
   emit_blank(lines)
   emit_section(lines, meta, 'Inbox', state.data.notifications, function(ls, m, n)
     emit_notification(ls, m, n)
   end, 'No notifications')
 
   emit_divider(lines, 'Jira')
+  emit_jira_legend(lines)
   emit_blank(lines)
   local active = state.data.jira_active
   if active == nil then
@@ -580,18 +718,188 @@ function M.checkout_under_cursor()
   tmux_run({ cmd_str }, repo_path)
 end
 
+local function open_diff_window(title, body)
+  local buf = vim.api.nvim_create_buf(false, true)
+  local lines = vim.split(body, '\n', { plain = true })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = 'diff'
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+
+  local width = math.min(160, math.floor(vim.o.columns * 0.9))
+  local height = math.min(50, math.floor(vim.o.lines * 0.9))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local available = vim.o.lines - vim.o.cmdheight - statusline
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = math.floor((available - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = 'minimal',
+    border = 'rounded',
+    title = ' ' .. title .. ' ',
+    title_pos = 'center',
+  })
+
+  vim.wo[win].cursorline = true
+  vim.wo[win].wrap = false
+  vim.wo[win].number = true
+
+  local close = function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+  local opts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, opts)
+  vim.keymap.set('n', '<Esc>', close, opts)
+end
+
 function M.diff_under_cursor()
   local m = under_cursor()
   if not m or not m.pr then
     return
   end
-  if not in_tmux() then
-    vim.notify('Not in a tmux session', vim.log.levels.WARN)
+  vim.notify('Loading diff…', vim.log.levels.INFO)
+  vim.system({ 'gh', 'pr', 'diff', m.url }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        vim.notify('Failed to fetch diff: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
+        return
+      end
+      local title = string.format('%s#%d', m.pr.repo, m.pr.number)
+      open_diff_window(title, obj.stdout)
+    end)
+  end)
+end
+
+local function open_result_window(title, content, on_reprompt)
+  local buf = vim.api.nvim_create_buf(false, true)
+  local lines = vim.split(content, '\n', { plain = true })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = 'markdown'
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+
+  local width = math.min(110, math.floor(vim.o.columns * 0.75))
+  local height = math.min(35, math.floor(vim.o.lines * 0.7))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local available = vim.o.lines - vim.o.cmdheight - statusline
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = math.floor((available - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = 'minimal',
+    border = 'rounded',
+    title = ' ' .. title .. ' ',
+    title_pos = 'center',
+  })
+  vim.wo[win].cursorline = false
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+
+  local close = function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+  local opts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, opts)
+  vim.keymap.set('n', '<Esc>', close, opts)
+  if on_reprompt then
+    vim.keymap.set('n', '1', function()
+      close()
+      on_reprompt 'summary'
+    end, opts)
+    vim.keymap.set('n', '2', function()
+      close()
+      on_reprompt 'understand'
+    end, opts)
+    vim.keymap.set('n', '3', function()
+      close()
+      on_reprompt 'risks'
+    end, opts)
+    vim.keymap.set('n', '4', function()
+      close()
+      on_reprompt 'next_step'
+    end, opts)
+  end
+end
+
+local function run_claude(meta, prompt_key)
+  local claude = require 'dashboard.claude'
+  vim.notify('Asking Claude (' .. prompt_key .. ')…', vim.log.levels.INFO)
+  claude.analyze(meta, prompt_key, function(result, err)
+    if not result then
+      vim.notify('Claude error: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      return
+    end
+    local title = string.format('%s · %s', result.label, result.ctx_id or '?')
+    local footer = '\n\n— 1 summary · 2 understand · 3 risks · 4 next · q close'
+    open_result_window(title, result.text .. footer, function(next_key)
+      run_claude(meta, next_key)
+    end)
+  end)
+end
+
+function M.analyze_under_cursor(prompt_key)
+  local m = under_cursor()
+  if not m or not m.kind then
     return
   end
-  local shell = vim.env.SHELL or '/bin/sh'
-  local cmd_str = string.format('gh pr diff %s | less -R; exec %s', vim.fn.shellescape(m.url), shell)
-  tmux_run { cmd_str }
+  run_claude(m, prompt_key or 'summary')
+end
+
+function M.pick_prompt_under_cursor()
+  local m = under_cursor()
+  if not m or not m.kind then
+    return
+  end
+  local claude = require 'dashboard.claude'
+  local prompts, order = claude.prompts()
+  local labels = {}
+  for _, k in ipairs(order) do
+    table.insert(labels, prompts[k].label)
+  end
+  vim.ui.select(labels, { prompt = 'Claude prompt:' }, function(_, idx)
+    if not idx then
+      return
+    end
+    run_claude(m, order[idx])
+  end)
+end
+
+function M.mark_read_under_cursor()
+  local m = under_cursor()
+  if not m or not m.notification_id then
+    return
+  end
+  local id = m.notification_id
+  vim.system({ 'gh', 'api', '-X', 'PATCH', 'notifications/threads/' .. id }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        vim.notify('Failed to mark as read: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
+        return
+      end
+      if type(state.data.notifications) == 'table' then
+        local kept = {}
+        for _, n in ipairs(state.data.notifications) do
+          if n.id ~= id then
+            table.insert(kept, n)
+          end
+        end
+        state.data.notifications = kept
+        render()
+      end
+    end)
+  end)
 end
 
 function M.yank_under_cursor()
@@ -686,6 +994,11 @@ function M.open()
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
+  vim.keymap.set('n', 'x', M.mark_read_under_cursor, opts)
+  vim.keymap.set('n', 's', function()
+    M.analyze_under_cursor 'summary'
+  end, opts)
+  vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
 
   vim.api.nvim_create_autocmd({ 'BufEnter', 'FocusGained' }, {
     buffer = state.buf,

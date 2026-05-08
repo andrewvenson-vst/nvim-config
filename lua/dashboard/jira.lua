@@ -35,7 +35,7 @@ local function search(jql, callback)
 
   local body = vim.json.encode({
     jql = jql,
-    fields = { 'summary', 'status', 'priority' },
+    fields = { 'summary', 'status', 'priority', 'comment', 'statuscategorychangedate', 'customfield_11615' },
     maxResults = 30,
   })
 
@@ -70,11 +70,19 @@ local function search(jql, callback)
       end
       local issues = {}
       for _, issue in ipairs(parsed.issues or {}) do
+        local f = issue.fields or {}
+        local qa = f.customfield_11615
+        local cs = (f.comment and f.comment.comments) or {}
+        local last_c = cs[#cs]
         table.insert(issues, {
           key = issue.key,
-          summary = (issue.fields and issue.fields.summary) or '',
-          status = (issue.fields and issue.fields.status and issue.fields.status.name) or '',
+          summary = f.summary or '',
+          status = (f.status and f.status.name) or '',
           url = config.base_url .. '/browse/' .. issue.key,
+          qa_assignee = (qa and qa.displayName) or nil,
+          last_comment_at = last_c and last_c.created or nil,
+          last_comment_author = (last_c and last_c.author and last_c.author.displayName) or nil,
+          status_change_at = f.statuscategorychangedate,
         })
       end
       callback(issues)
