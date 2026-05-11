@@ -17,4 +17,15 @@ require('dashboard').setup {
     ['vitalsource/vst-external'] = '~/projects/vst-external',
     ['vitalsource/vst-utils'] = '~/projects/vst-utils',
   },
+  jira_status_order = {
+    'Blocked',
+    'Blocked / On Hold',
+    'On Hold',
+    'In Progress',
+    'Peer Review',
+    'Needs QA',
+    'In QA',
+    'Passed QA',
+    'Refinement',
+  },
 }
