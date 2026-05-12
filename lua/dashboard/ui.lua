@@ -612,6 +612,114 @@ local function emit_notifications_legend(lines)
   })
 end
 
+local function emit_notes_legend(lines)
+  emit_legend(lines, {
+    OPEN_BR,
+    { text = 'n', hl = '@keyword' },
+    { text = ' note · ', hl = 'Comment' },
+    { text = 'T', hl = '@keyword' },
+    { text = ' todo · ', hl = 'Comment' },
+    { text = 'x', hl = '@keyword' },
+    { text = ' toggle · ', hl = 'Comment' },
+    { text = '<CR>', hl = '@keyword' },
+    { text = ' open file', hl = 'Comment' },
+    CLOSE_BR,
+  })
+end
+
+local function note_kind(line)
+  if line:match '^%s*%-%s*%[%s%]' then
+    return 'todo_open'
+  end
+  if line:match '^%s*%-%s*%[[xX]%]' then
+    return 'todo_done'
+  end
+  return 'note'
+end
+
+local function rank_kind(k)
+  if k == 'todo_open' then
+    return 1
+  end
+  if k == 'note' then
+    return 2
+  end
+  return 3
+end
+
+local function note_segments(line, kind)
+  if kind == 'todo_open' then
+    local _, e = line:find '^%s*%-%s*%[%s%]'
+    return {
+      { text = line:sub(1, e), hl = 'DiagnosticWarn' },
+      { text = line:sub(e + 1), hl = 'Normal' },
+    }
+  elseif kind == 'todo_done' then
+    local _, e = line:find '^%s*%-%s*%[[xX]%]'
+    return {
+      { text = line:sub(1, e), hl = 'DiagnosticOk' },
+      { text = line:sub(e + 1), hl = 'Comment' },
+    }
+  end
+  return { { text = line, hl = 'Normal' } }
+end
+
+local function emit_notes_section(lines, meta, filter)
+  local notes_mod = require 'dashboard.notes'
+  local path = notes_mod.path_for_today()
+  local raw = notes_mod.read_today()
+
+  local entries = {}
+  for i, line in ipairs(raw) do
+    if line and line:gsub('%s', '') ~= '' then
+      table.insert(entries, { text = line, file_line = i, kind = note_kind(line) })
+    end
+  end
+
+  if filter and filter ~= '' then
+    local kept = {}
+    for _, e in ipairs(entries) do
+      if matches_filter(e.text, filter) then
+        table.insert(kept, e)
+      end
+    end
+    entries = kept
+  end
+
+  table.sort(entries, function(a, b)
+    if rank_kind(a.kind) ~= rank_kind(b.kind) then
+      return rank_kind(a.kind) < rank_kind(b.kind)
+    end
+    return a.file_line < b.file_line
+  end)
+
+  emit_divider(lines, 'Notes · ' .. os.date '%Y-%m-%d')
+  emit_notes_legend(lines)
+  emit_blank(lines)
+
+  if #entries == 0 then
+    local msg = (filter and filter ~= '') and '(no matching notes)' or '(no notes yet — press n to add one)'
+    local idx, cols = emit(lines, {
+      { text = PAD, hl = nil },
+      { text = BAR .. ' ', hl = 'NonText' },
+      { text = msg, hl = 'Comment' },
+    })
+    paint(idx, cols)
+    meta[idx + 1] = { kind = 'note', path = path }
+  else
+    for _, e in ipairs(entries) do
+      local segs = { { text = PAD, hl = nil }, { text = BAR .. ' ', hl = 'NonText' } }
+      for _, s in ipairs(note_segments(e.text, e.kind)) do
+        table.insert(segs, s)
+      end
+      local idx, cols = emit(lines, segs)
+      paint(idx, cols)
+      meta[idx + 1] = { kind = 'note', path = path, file_line = e.file_line, todo_kind = e.kind }
+    end
+  end
+  emit_blank(lines)
+end
+
 local function emit_jira_legend(lines)
   emit_legend(lines, {
     OPEN_BR,
@@ -670,6 +778,7 @@ local function render()
   end)
 
   emit_header(lines)
+  emit_notes_section(lines, meta, f)
   emit_divider(lines, 'GitHub')
   emit_github_legend(lines)
   emit_blank(lines)
@@ -746,8 +855,80 @@ end
 
 function M.open_under_cursor()
   local m = under_cursor()
-  if m and m.url then
+  if not m then
+    return
+  end
+  if m.kind == 'note' and m.path then
+    M.close()
+    vim.cmd('edit ' .. vim.fn.fnameescape(m.path))
+    return
+  end
+  if m.url then
     vim.ui.open(m.url)
+  end
+end
+
+function M.add_note()
+  vim.ui.input({ prompt = 'Note: ' }, function(input)
+    if not input or input == '' then
+      return
+    end
+    if not input:match '^%s*%-' then
+      input = '- ' .. input
+    end
+    local ok, err = require('dashboard.notes').append(input)
+    if not ok then
+      vim.notify('Failed to save note: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      return
+    end
+    if buf_valid() then
+      render()
+    end
+  end)
+end
+
+function M.add_todo()
+  vim.ui.input({ prompt = 'Todo: ' }, function(input)
+    if not input or input == '' then
+      return
+    end
+    if not input:match '^%s*%-?%s*%[' then
+      input = input:gsub('^%s*%-?%s*', '')
+      input = '- [ ] ' .. input
+    end
+    local ok, err = require('dashboard.notes').append(input)
+    if not ok then
+      vim.notify('Failed to save todo: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      return
+    end
+    if buf_valid() then
+      render()
+    end
+  end)
+end
+
+function M.toggle_todo()
+  local m = under_cursor()
+  if not m or m.kind ~= 'note' or not m.file_line or not m.path then
+    return
+  end
+  local lines = vim.fn.readfile(m.path)
+  local original = lines[m.file_line]
+  if not original then
+    return
+  end
+  local toggled
+  if original:match '^%s*%-%s*%[%s%]' then
+    toggled = original:gsub('(%[)%s(%])', '%1x%2', 1)
+  elseif original:match '^%s*%-%s*%[[xX]%]' then
+    toggled = original:gsub('(%[)[xX](%])', '%1 %2', 1)
+  else
+    return
+  end
+  lines[m.file_line] = toggled
+  vim.fn.writefile(lines, m.path)
+  if buf_valid() then
+    render()
   end
 end
 
@@ -1233,12 +1414,24 @@ function M.open()
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 't', M.threads_under_cursor, opts)
-  vim.keymap.set('n', 'x', M.mark_read_under_cursor, opts)
+  vim.keymap.set('n', 'x', function()
+    local m = under_cursor()
+    if not m then
+      return
+    end
+    if m.notification_id then
+      M.mark_read_under_cursor()
+    elseif m.kind == 'note' and m.file_line then
+      M.toggle_todo()
+    end
+  end, opts)
+  vim.keymap.set('n', 'T', M.add_todo, opts)
   vim.keymap.set('n', 's', function()
     M.analyze_under_cursor 'summary'
   end, opts)
   vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
   vim.keymap.set('n', 'f', M.filter_prompt, opts)
+  vim.keymap.set('n', 'n', M.add_note, opts)
 
   vim.api.nvim_create_autocmd('FocusGained', {
     buffer = state.buf,

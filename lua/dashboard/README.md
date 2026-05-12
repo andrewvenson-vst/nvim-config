@@ -1,8 +1,9 @@
 # Status Dashboard
 
 A single floating window in Neovim that surfaces my GitHub PRs, GitHub
-notifications, and Jira tickets — with one-keystroke actions for opening,
-checking out, diffing, browsing review threads, and asking Claude.
+notifications, Jira tickets, and today's notes/todos — with one-keystroke
+actions for opening, checking out, diffing, browsing review threads, asking
+Claude, and managing the daily notes file.
 
 ## Features
 
@@ -16,8 +17,13 @@ checking out, diffing, browsing review threads, and asking Claude.
   `Peer Review`, `Needs QA`, `In QA`, `Passed QA`, `Refinement`, plus any
   `Blocked` / `On Hold` if configured). Each ticket shows QA assignee and
   days-in-status. PRs that mention a ticket key auto-attach as sub-lines.
+- **Today's notes and todos** — reads `~/notes/YYYY-MM-DD.txt`. `n` appends a
+  free-form note, `T` appends a `- [ ]` todo, `x` toggles a todo's checkbox in
+  the file. The file is auto-created on first append. View is sorted: open
+  todos first (yellow), plain notes in the middle, completed todos at the
+  bottom (muted).
 - **Cross-section filter** — `f` narrows every section at once by ticket key,
-  repo, or any substring.
+  repo, or any substring (notes included).
 - **Per-row actions**: open in browser, yank URL, checkout PR in a new tmux
   pane, view diff in a floating window, view all unresolved review threads,
   mark notification as read.
@@ -85,6 +91,12 @@ require('dashboard').setup {
 
   -- Seconds before the dashboard auto-refreshes on FocusGained. Default 60.
   refresh_after = 60,
+
+  -- Daily notes file. Defaults shown. Filename is os.date() format.
+  notes = {
+    notes_dir = '~/notes',
+    filename_format = '%Y-%m-%d.txt',
+  },
 }
 ```
 
@@ -123,6 +135,15 @@ Notification rows additionally:
 | --- | --- |
 | `x` | Mark the notification as read (removes the row locally) |
 
+Notes section additionally:
+
+| Key | Action |
+| --- | --- |
+| `n` | Append a free-form note to today's file (auto-prepends `- `) |
+| `T` | Append a todo to today's file (auto-prepends `- [ ] `) |
+| `x` | Toggle the checkbox on the cursor row (`- [ ]` ↔ `- [x]`) |
+| `<CR>` | Close dashboard and open today's notes file for editing |
+
 Jira rows: `s` and `?` work on tickets too.
 
 ### Inside the result window (Claude / diff / threads)
@@ -150,3 +171,6 @@ Jira rows: `s` and `?` work on tickets too.
 - Re-prompts in the Claude result window are instant because the fetched
   context is cached per dashboard session. The cache clears when you close
   the dashboard.
+- The notes section sorts entries for display (open todos → plain notes →
+  completed todos), but the underlying file stays append-only chronological,
+  so it remains grep-friendly and readable elsewhere.
