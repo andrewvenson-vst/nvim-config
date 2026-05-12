@@ -124,7 +124,7 @@ PR rows additionally:
 | Key | Action |
 | --- | --- |
 | `c` | `gh pr checkout <num>` in a new tmux pane in the configured repo dir |
-| `D` | Show the PR diff in a floating window (markdown filetype, scrollable) |
+| `D` | Show the PR diff in a two-pane floating window: file list on the left (`+N -M` stats), diff on the right. Inside: `<CR>` on a file jumps the diff to that file's hunk, `<Tab>` switches focus between panes, `q` closes both. |
 | `t` | Show all unresolved review threads with diff hunks and threaded comments |
 | `s` | Ask Claude for a one-keystroke summary |
 | `?` | Pick from: summary, understand, risks, next-step, code-review |

@@ -964,46 +964,175 @@ function M.checkout_under_cursor()
   tmux_run({ cmd_str }, repo_path)
 end
 
-local function open_diff_window(title, body)
-  local buf = vim.api.nvim_create_buf(false, true)
-  local lines = vim.split(body, '\n', { plain = true })
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.bo[buf].filetype = 'diff'
-  vim.bo[buf].buftype = 'nofile'
-  vim.bo[buf].modifiable = false
-  vim.bo[buf].bufhidden = 'wipe'
+local function parse_diff(diff_text)
+  local lines = vim.split(diff_text or '', '\n', { plain = true })
+  local files = {}
+  local current
+  for i, line in ipairs(lines) do
+    if line:match '^diff %-%-git ' then
+      if current then
+        table.insert(files, current)
+      end
+      local b_path = line:match 'b/(.+)$' or '?'
+      current = { path = b_path, start_line = i, add = 0, del = 0 }
+    elseif current then
+      if line:match '^%+%+%+' or line:match '^%-%-%-' then
+        -- header line, skip
+      elseif line:sub(1, 1) == '+' then
+        current.add = current.add + 1
+      elseif line:sub(1, 1) == '-' then
+        current.del = current.del + 1
+      end
+    end
+  end
+  if current then
+    table.insert(files, current)
+  end
+  return files
+end
 
-  local width = math.min(160, math.floor(vim.o.columns * 0.9))
+local function open_diff_window(title, body)
+  local files = parse_diff(body)
+
+  -- Layout: two abutting floating windows.
+  -- total visual width = left_content + right_content + 4 (four borders).
+  local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+  local left_content_w = 35
+  local right_content_w = total_w - left_content_w - 4
+  if right_content_w < 40 then
+    -- Narrow terminals: shrink left pane.
+    left_content_w = math.max(20, total_w - 44)
+    right_content_w = total_w - left_content_w - 4
+  end
   local height = math.min(50, math.floor(vim.o.lines * 0.9))
   local statusline = vim.o.laststatus > 0 and 1 or 0
   local available = vim.o.lines - vim.o.cmdheight - statusline
+  local row = math.floor((available - height) / 2)
+  local total_col_start = math.floor((vim.o.columns - total_w) / 2)
+  local left_col = total_col_start + 1
+  local right_col = left_col + left_content_w + 2 -- past left right-border + right left-border
 
-  local win = vim.api.nvim_open_win(buf, true, {
+  -- Right (diff) buffer + window
+  local right_buf = vim.api.nvim_create_buf(false, true)
+  local body_lines = vim.split(body or '', '\n', { plain = true })
+  vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, body_lines)
+  vim.bo[right_buf].filetype = 'diff'
+  vim.bo[right_buf].buftype = 'nofile'
+  vim.bo[right_buf].modifiable = false
+  vim.bo[right_buf].bufhidden = 'wipe'
+
+  local right_win = vim.api.nvim_open_win(right_buf, false, {
     relative = 'editor',
-    width = width,
+    width = right_content_w,
     height = height,
-    row = math.floor((available - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
+    row = row,
+    col = right_col,
     style = 'minimal',
     border = 'rounded',
     title = ' ' .. title .. ' ',
     title_pos = 'center',
     zindex = 60,
   })
-  state.last_result_win = win
+  vim.wo[right_win].cursorline = true
+  vim.wo[right_win].wrap = false
+  vim.wo[right_win].number = true
 
-  vim.wo[win].cursorline = true
-  vim.wo[win].wrap = false
-  vim.wo[win].number = true
+  -- Left (file list) buffer + window
+  local left_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[left_buf].buftype = 'nofile'
+  vim.bo[left_buf].bufhidden = 'wipe'
 
-  local close = function()
-    if vim.api.nvim_win_is_valid(win) then
-      vim.api.nvim_win_close(win, true)
+  local left_win = vim.api.nvim_open_win(left_buf, true, {
+    relative = 'editor',
+    width = left_content_w,
+    height = height,
+    row = row,
+    col = left_col,
+    style = 'minimal',
+    border = 'rounded',
+    title = string.format(' Files (%d) ', #files),
+    title_pos = 'center',
+    zindex = 60,
+  })
+  vim.wo[left_win].cursorline = true
+  vim.wo[left_win].wrap = false
+
+  -- Render file list
+  local list_lines = {}
+  local hl_ranges = {}
+  for _, f in ipairs(files) do
+    local path = f.path
+    local add_str = '+' .. f.add
+    local del_str = '-' .. f.del
+    local stats = '  ' .. add_str .. ' ' .. del_str
+    local max_path = left_content_w - #stats - 1
+    if #path > max_path and max_path > 1 then
+      path = '…' .. path:sub(#path - max_path + 2)
+    end
+    local line = path .. stats
+    table.insert(list_lines, line)
+    local add_start = #path + 2
+    local add_end = add_start + #add_str
+    local del_start = add_end + 1
+    local del_end = del_start + #del_str
+    table.insert(
+      hl_ranges,
+      { line = #list_lines - 1, ranges = { { add_start, add_end, 'DiagnosticOk' }, { del_start, del_end, 'DiagnosticError' } } }
+    )
+  end
+  if #list_lines == 0 then
+    list_lines = { '(no files in diff)' }
+  end
+
+  vim.bo[left_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
+  for _, h in ipairs(hl_ranges) do
+    for _, r in ipairs(h.ranges) do
+      vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, r[1], { end_col = r[2], hl_group = r[3] })
     end
   end
-  local opts = { buffer = buf, nowait = true, silent = true }
-  vim.keymap.set('n', 'q', close, opts)
-  vim.keymap.set('n', '<Esc>', close, opts)
+  vim.bo[left_buf].modifiable = false
+
+  state.last_result_win = right_win
+
+  local close = function()
+    for _, w in ipairs { left_win, right_win } do
+      if vim.api.nvim_win_is_valid(w) then
+        vim.api.nvim_win_close(w, true)
+      end
+    end
+  end
+
+  local function jump_to_file()
+    local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
+    local f = files[lnum]
+    if not f or not vim.api.nvim_win_is_valid(right_win) then
+      return
+    end
+    vim.api.nvim_win_call(right_win, function()
+      vim.api.nvim_win_set_cursor(right_win, { f.start_line, 0 })
+      vim.cmd 'normal! zt'
+    end)
+  end
+
+  local left_opts = { buffer = left_buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, left_opts)
+  vim.keymap.set('n', '<Esc>', close, left_opts)
+  vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
+  vim.keymap.set('n', '<Tab>', function()
+    if vim.api.nvim_win_is_valid(right_win) then
+      vim.api.nvim_set_current_win(right_win)
+    end
+  end, left_opts)
+
+  local right_opts = { buffer = right_buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, right_opts)
+  vim.keymap.set('n', '<Esc>', close, right_opts)
+  vim.keymap.set('n', '<Tab>', function()
+    if vim.api.nvim_win_is_valid(left_win) then
+      vim.api.nvim_set_current_win(left_win)
+    end
+  end, right_opts)
 end
 
 local function ago(iso)
