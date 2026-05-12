@@ -17,6 +17,10 @@ function M.setup(opts)
   vim.keymap.set('n', '<leader>od', function()
     require('dashboard.ui').open()
   end, { desc = '[O]pen [D]ashboard' })
+
+  vim.keymap.set('n', '<leader>or', function()
+    require('dashboard.ui').focus_last_result()
+  end, { desc = '[O]pen last [R]esult window' })
 end
 
 return M

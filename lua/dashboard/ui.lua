@@ -12,6 +12,7 @@ local state = {
   data = {},
   last_refresh = nil,
   filter = nil,
+  last_result_win = nil,
 }
 
 local pending_hls = {}
@@ -806,7 +807,9 @@ local function open_diff_window(title, body)
     border = 'rounded',
     title = ' ' .. title .. ' ',
     title_pos = 'center',
+    zindex = 60,
   })
+  state.last_result_win = win
 
   vim.wo[win].cursorline = true
   vim.wo[win].wrap = false
@@ -947,7 +950,9 @@ function open_result_window(title, on_reprompt, loading_text)
     border = 'rounded',
     title = ' ' .. title .. ' ',
     title_pos = 'center',
+    zindex = 60,
   })
+  state.last_result_win = win
   vim.wo[win].cursorline = false
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
@@ -1129,6 +1134,15 @@ function M.close()
   state.win = nil
   state.buf = nil
   state.line_meta = {}
+end
+
+function M.focus_last_result()
+  local w = state.last_result_win
+  if w and vim.api.nvim_win_is_valid(w) then
+    vim.api.nvim_set_current_win(w)
+  else
+    vim.notify('No active result window', vim.log.levels.INFO)
+  end
 end
 
 function M.filter_prompt()

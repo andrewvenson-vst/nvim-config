@@ -17,6 +17,18 @@ function M.config()
       hl['DiagnosticUnderlineWarn'] = { undercurl = true, sp = palette.yellow }
     end,
   }
+
+  -- Force an opaque background so iTerm transparency doesn't bleed through nvim.
+  vim.api.nvim_create_autocmd('ColorScheme', {
+    pattern = '*',
+    callback = function()
+      local bg = '#2d353b' -- everforest dark medium
+      for _, g in ipairs { 'Normal', 'NormalNC', 'NormalFloat', 'SignColumn', 'EndOfBuffer' } do
+        vim.api.nvim_set_hl(0, g, { bg = bg })
+      end
+    end,
+  })
+
   everforest.load()
 end
 
