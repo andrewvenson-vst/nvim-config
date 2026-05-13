@@ -1510,12 +1510,14 @@ local function open_diff_window(title, body, overview, opts)
   opts = opts or {}
   on_viewer_open()
   clear_loading()
-  local files, body_lines, row_info
+  local files, body_lines, row_info, body_row_to_file
 
   local function parse_body(b)
     files = parse_diff(b)
     body_lines = vim.split(b or '', '\n', { plain = true })
     row_info = {}
+    body_row_to_file = {}
+    local current_file = nil
     local old_l, new_l = 0, 0
     local max_old, max_new = 1, 1
     for i, line in ipairs(body_lines) do
@@ -1523,6 +1525,7 @@ local function open_diff_window(title, body, overview, opts)
       if line:match '^diff %-%-git ' then
         old_l, new_l = 0, 0
         info.is_file_header = true
+        current_file = line:match 'b/(.+)$'
       elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' then
         -- file metadata header: no gutter, no bg
       elseif line:match '^@@' then
@@ -1550,7 +1553,10 @@ local function open_diff_window(title, body, overview, opts)
       if info.new and #tostring(info.new) > max_new then
         max_new = #tostring(info.new)
       end
+      info.new_l_state = new_l
+      info.old_l_state = old_l
       row_info[i] = info
+      body_row_to_file[i] = current_file
     end
     row_info._max_old = max_old
     row_info._max_new = max_new
@@ -1739,6 +1745,11 @@ local function open_diff_window(title, body, overview, opts)
 
   render_right(geom.right_content_w)
 
+  if opts.initial_cursor then
+    local row = math.max(1, math.min(opts.initial_cursor[1] or 1, vim.api.nvim_buf_line_count(right_buf)))
+    pcall(vim.api.nvim_win_set_cursor, right_win, { row, opts.initial_cursor[2] or 0 })
+  end
+
   -- Left (file list) buffer + window
   local left_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[left_buf].buftype = 'nofile'
@@ -1777,7 +1788,7 @@ local function open_diff_window(title, body, overview, opts)
     }
   end
 
-  local left_win = vim.api.nvim_open_win(left_buf, true, left_win_config())
+  local left_win = vim.api.nvim_open_win(left_buf, false, left_win_config())
   local function apply_left_winopts()
     vim.wo[left_win].cursorline = true
     vim.wo[left_win].wrap = false
@@ -1785,6 +1796,7 @@ local function open_diff_window(title, body, overview, opts)
       'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
   end
   apply_left_winopts()
+  pcall(vim.api.nvim_set_current_win, right_win)
 
   local function render_left(content_w)
     local list_lines = {}
@@ -1835,11 +1847,20 @@ local function open_diff_window(title, body, overview, opts)
   state.diff_right_win = right_win
 
   local closing = false
+  local function persist_cursor()
+    if opts.on_close and right_win and vim.api.nvim_win_is_valid(right_win) then
+      local ok, cur = pcall(vim.api.nvim_win_get_cursor, right_win)
+      if ok then
+        opts.on_close(cur)
+      end
+    end
+  end
   local close = function()
     if closing then
       return
     end
     closing = true
+    persist_cursor()
     if left_win and vim.api.nvim_win_is_valid(left_win) then
       pcall(vim.api.nvim_win_close, left_win, true)
     end
@@ -1961,6 +1982,60 @@ local function open_diff_window(title, body, overview, opts)
     end)
   end
 
+  -- Opens the file under the cursor in the right pane, at the new-side line
+  -- number from that diff row. Closes the diff viewer.
+  local function open_at_cursor()
+    if not opts.cwd then
+      return
+    end
+    if not (right_win and vim.api.nvim_win_is_valid(right_win)) then
+      return
+    end
+    local buf_row = vim.api.nvim_win_get_cursor(right_win)[1] - 1
+    local header_len = buf_row - (buf_row) -- placeholder; compute below
+    -- header_len is the count of header lines (PR overview card). For local
+    -- diff there's no overview so header_len == 0 — but compute properly via
+    -- the upvalue captured by render_right. Instead of plumbing it, infer
+    -- the body index by walking back to find the nearest 'diff --git'.
+    local body_row = buf_row + 1
+    -- If we're inside the PR header (above the first diff --git), body_row
+    -- maps to a position before any file; walk forward in body_lines to skip.
+    -- For local diff, buf row 0 == body line 1 anyway since header_len == 0.
+    -- For PR diff (with overview), find header_len from the first file's
+    -- start: parse_diff returns f.start_line in body coords, and we patch
+    -- f.start_line = f._raw_start + header_len in render_right. Reverse it:
+    local computed_header_len = (files[1] and files[1].start_line and files[1]._raw_start)
+        and (files[1].start_line - files[1]._raw_start)
+      or 0
+    body_row = buf_row + 1 - computed_header_len
+    if body_row < 1 or body_row > #body_lines then
+      return
+    end
+    local info = row_info[body_row]
+    local file = body_row_to_file[body_row]
+    if not file then
+      return
+    end
+    local line_num = (info and (info.new or info.old)) or 1
+    -- Resolve file relative to cwd (or git root). git diff paths are repo-root
+    -- relative; if user runs from repo root, this matches cwd directly.
+    local path = opts.cwd .. '/' .. file
+    -- Tear down the hidden dashboard so it doesn't reopen behind the file.
+    if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+      pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
+    end
+    state.buf = nil
+    state.win = nil
+    state.dashboard_cursor = nil
+    state.viewer_count = 0
+    close()
+    vim.schedule(function()
+      vim.cmd('edit ' .. vim.fn.fnameescape(path))
+      pcall(vim.api.nvim_win_set_cursor, 0, { line_num, 0 })
+      vim.cmd 'normal! zz'
+    end)
+  end
+
   local left_opts = { buffer = left_buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
@@ -1981,6 +2056,9 @@ local function open_diff_window(title, body, overview, opts)
   vim.keymap.set('n', '\\', toggle_files, right_opts)
   if opts.refresh_fn then
     vim.keymap.set('n', 'r', refresh, right_opts)
+  end
+  if opts.cwd then
+    vim.keymap.set('n', '<CR>', open_at_cursor, right_opts)
   end
   vim.keymap.set('n', '<Tab>', function()
     if not left_win or not vim.api.nvim_win_is_valid(left_win) then
@@ -3188,13 +3266,19 @@ function M.show_local_diff()
       vim.notify('No local changes vs ' .. (label or '?'), vim.log.levels.INFO)
       return
     end
-    local branch = vim.fn.fnamemodify(vim.fn.getcwd(), ':t')
+    local cwd = vim.fn.getcwd()
+    local branch = vim.fn.fnamemodify(cwd, ':t')
     local title = string.format('%s · local vs %s', branch, label)
     open_diff_window(title, diff, nil, {
+      cwd = cwd,
       refresh_fn = function(cb)
         fetch_local_diff(function(new_diff, new_err)
           cb(new_diff, new_err)
         end)
+      end,
+      initial_cursor = state.local_diff_cursor,
+      on_close = function(cur)
+        state.local_diff_cursor = cur
       end,
     })
   end)
