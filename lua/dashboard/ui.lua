@@ -1556,6 +1556,33 @@ local function open_diff_window(title, body)
   end, right_opts)
 end
 
+local function wrap_text(text, max_w)
+  local out = {}
+  for line in (text .. '\n'):gmatch '([^\n]*)\n' do
+    if line == '' then
+      table.insert(out, '')
+    elseif vim.fn.strdisplaywidth(line) <= max_w then
+      table.insert(out, line)
+    else
+      local current = ''
+      for word in line:gmatch '%S+' do
+        if current == '' then
+          current = word
+        elseif vim.fn.strdisplaywidth(current .. ' ' .. word) > max_w then
+          table.insert(out, current)
+          current = word
+        else
+          current = current .. ' ' .. word
+        end
+      end
+      if current ~= '' then
+        table.insert(out, current)
+      end
+    end
+  end
+  return out
+end
+
 local function ago(iso)
   local label = (relative_time(iso))
   if label == '' then
@@ -1567,10 +1594,382 @@ local function ago(iso)
   return label .. ' ago'
 end
 
-local function format_review_threads(threads, ctx_id)
+local function group_threads_by_file(threads)
+  local unresolved = {}
+  for _, t in ipairs(threads or {}) do
+    if not t.isResolved then
+      table.insert(unresolved, t)
+    end
+  end
+  local by_file = {}
+  local files = {}
+  for _, t in ipairs(unresolved) do
+    local path = t.path or '?'
+    if not by_file[path] then
+      by_file[path] = {}
+      table.insert(files, path)
+    end
+    table.insert(by_file[path], t)
+  end
+  table.sort(files)
+  local ordered = {}
+  for _, f in ipairs(files) do
+    table.insert(ordered, { path = f, threads = by_file[f] })
+  end
+  return ordered, #unresolved
+end
+
+local function open_threads_window(title, threads, ctx_id)
+  local groups, total = group_threads_by_file(threads)
+
+  local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+  local left_content_w = 38
+  local right_content_w = total_w - left_content_w - 4
+  if right_content_w < 40 then
+    left_content_w = math.max(20, total_w - 44)
+    right_content_w = total_w - left_content_w - 4
+  end
+  local height = math.min(50, math.floor(vim.o.lines * 0.9))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local available = vim.o.lines - vim.o.cmdheight - statusline
+  local row = math.floor((available - height) / 2)
+  local total_col_start = math.floor((vim.o.columns - total_w) / 2)
+  local left_col = total_col_start + 1
+  local right_col = left_col + left_content_w + 2
+
+  -- Right (threads) buffer + window
+  local right_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[right_buf].buftype = 'nofile'
+  vim.bo[right_buf].bufhidden = 'wipe'
+
+  local right_win = vim.api.nvim_open_win(right_buf, false, {
+    relative = 'editor',
+    width = right_content_w,
+    height = height,
+    row = row,
+    col = right_col,
+    style = 'minimal',
+    border = 'rounded',
+    title = ' ' .. title .. ' ',
+    title_pos = 'center',
+    zindex = 60,
+  })
+  state.last_result_win = right_win
+  vim.wo[right_win].cursorline = false
+  vim.wo[right_win].wrap = false
+  vim.wo[right_win].number = false
+  vim.wo[right_win].signcolumn = 'no'
+  vim.wo[right_win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
+
+  -- Render threads grouped by file; record per-file start line
   local lines = {}
-  table.insert(lines, '# Review threads · ' .. ctx_id)
-  table.insert(lines, '')
+  local line_bgs = {}
+  local range_hls = {}
+  local file_start_lines = {}
+
+  local function push_raw(text)
+    table.insert(lines, text)
+    return #lines - 1
+  end
+  local function push_bg(text, bg)
+    local idx = push_raw(text)
+    if bg then
+      table.insert(line_bgs, { line = idx, hl = bg })
+    end
+    return idx
+  end
+  local function push_seg(segs)
+    local text = ''
+    local local_hls = {}
+    for _, s in ipairs(segs) do
+      local col_start = #text
+      text = text .. s.text
+      if s.hl then
+        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+      end
+    end
+    local idx = push_raw(text)
+    for _, h in ipairs(local_hls) do
+      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    end
+    return idx
+  end
+
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = 'REVIEW THREADS', hl = 'Title' },
+    { text = '  ' .. ctx_id, hl = 'Comment' },
+  }
+  push_raw('')
+  if total == 0 then
+    push_seg {
+      { text = '  ', hl = nil },
+      { text = '(no unresolved review threads)', hl = 'Comment' },
+    }
+  else
+    push_seg {
+      { text = '  ', hl = nil },
+      { text = ' ' .. total .. ' unresolved ', hl = 'DashboardPillWarn' },
+    }
+  end
+  push_raw('')
+  push_raw('')
+
+  local indent = '  '
+  local border_w = math.max(10, right_content_w - 6)
+  local bar_prefix = '  │  '
+  local bar_w = vim.fn.strdisplaywidth(bar_prefix)
+  local reply_border_w = math.max(10, right_content_w - bar_w - 4)
+
+  for gi, group in ipairs(groups) do
+    for ti, t in ipairs(group.threads) do
+      if ti == 1 then
+        file_start_lines[gi] = #lines
+      end
+      local cs = (t.comments and t.comments.nodes) or {}
+      local first = cs[1]
+      local line_num = t.line or t.originalLine or '?'
+
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '╭' .. string.rep('─', border_w) .. '╮', hl = 'DashboardAccentGithub' },
+      }
+      local header_segs = {
+        { text = indent, hl = nil },
+        { text = '  ', hl = nil },
+        { text = group.path .. ':' .. tostring(line_num), hl = 'Title' },
+      }
+      if t.isOutdated then
+        table.insert(header_segs, { text = '  ', hl = nil })
+        table.insert(header_segs, { text = ' outdated ', hl = 'DashboardPillMuted' })
+      end
+      push_seg(header_segs)
+      if first and first.diffHunk and first.diffHunk ~= '' then
+        push_raw('')
+        for _, hline in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
+          local f = hline:sub(1, 1)
+          local hunk_bg
+          if hline:match '^@@' then
+            hunk_bg = 'DiffChange'
+          elseif f == '+' and not hline:match '^%+%+%+' then
+            hunk_bg = 'DiffAdd'
+          elseif f == '-' and not hline:match '^%-%-%-' then
+            hunk_bg = 'DiffDelete'
+          end
+          push_bg(indent .. '  ' .. hline, hunk_bg)
+        end
+      end
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '╰' .. string.rep('─', border_w) .. '╯', hl = 'DashboardAccentGithub' },
+      }
+
+      for _, c in ipairs(cs) do
+        local author = (c.author and c.author.login) or '?'
+        local age = ago(c.createdAt)
+        local prefix_w = bar_w + 2 + vim.fn.strdisplaywidth(author)
+        local age_w = vim.fn.strdisplaywidth(age)
+        local pad_w = right_content_w - prefix_w - age_w - 4
+        if pad_w < 2 then
+          pad_w = 2
+        end
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│', hl = 'DashboardAccentGithub' },
+        }
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│  ', hl = 'DashboardAccentGithub' },
+          { text = '╭' .. string.rep('─', reply_border_w) .. '╮', hl = 'DashboardAccentGithub' },
+        }
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│  ', hl = 'DashboardAccentGithub' },
+          { text = '  ', hl = nil },
+          { text = author, hl = 'Title' },
+          { text = string.rep(' ', pad_w), hl = nil },
+          { text = age, hl = 'Comment' },
+        }
+        local body_max = math.max(20, reply_border_w - 4)
+        for _, l in ipairs(wrap_text(c.body or '', body_max)) do
+          push_seg {
+            { text = '  ', hl = nil },
+            { text = '│  ', hl = 'DashboardAccentGithub' },
+            { text = '  ' .. l, hl = 'Normal' },
+          }
+        end
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│  ', hl = 'DashboardAccentGithub' },
+          { text = '╰' .. string.rep('─', reply_border_w) .. '╯', hl = 'DashboardAccentGithub' },
+        }
+      end
+
+      push_raw('')
+    end
+    push_raw('')
+  end
+
+  vim.bo[right_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, lines)
+  for _, h in ipairs(range_hls) do
+    vim.api.nvim_buf_set_extmark(right_buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  for _, bg in ipairs(line_bgs) do
+    vim.api.nvim_buf_set_extmark(right_buf, ns, bg.line, 0, {
+      end_line = bg.line + 1,
+      end_col = 0,
+      hl_group = bg.hl,
+      hl_eol = true,
+      priority = 10,
+    })
+  end
+  vim.bo[right_buf].modifiable = false
+
+  -- Left (file list) buffer + window
+  local left_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[left_buf].buftype = 'nofile'
+  vim.bo[left_buf].bufhidden = 'wipe'
+
+  local left_win = vim.api.nvim_open_win(left_buf, true, {
+    relative = 'editor',
+    width = left_content_w,
+    height = height,
+    row = row,
+    col = left_col,
+    style = 'minimal',
+    border = 'rounded',
+    title = string.format(' Files (%d) ', #groups),
+    title_pos = 'center',
+    zindex = 60,
+  })
+  vim.wo[left_win].cursorline = true
+  vim.wo[left_win].wrap = false
+  vim.wo[left_win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
+
+  local list_lines = {}
+  local list_hls = {}
+  local right_pad = 1
+  for _, group in ipairs(groups) do
+    local count_pill = ' ' .. tostring(#group.threads) .. ' '
+    local count_w = #count_pill
+    local path = group.path
+    local max_path = left_content_w - count_w - right_pad - 1
+    if #path > max_path and max_path > 1 then
+      path = '…' .. path:sub(#path - max_path + 2)
+    end
+    local gap = left_content_w - #path - count_w - right_pad
+    if gap < 1 then
+      gap = 1
+    end
+    local line = path .. string.rep(' ', gap) .. count_pill .. string.rep(' ', right_pad)
+    table.insert(list_lines, line)
+    local count_start = #path + gap
+    table.insert(list_hls, { line = #list_lines - 1, col_start = count_start, col_end = count_start + count_w })
+  end
+  if #list_lines == 0 then
+    list_lines = { '(no files with threads)' }
+  end
+
+  vim.bo[left_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
+  for _, h in ipairs(list_hls) do
+    vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = 'DashboardPillWarn',
+      priority = 100,
+    })
+  end
+  vim.bo[left_buf].modifiable = false
+
+  local close = function()
+    for _, w in ipairs { left_win, right_win } do
+      if vim.api.nvim_win_is_valid(w) then
+        vim.api.nvim_win_close(w, true)
+      end
+    end
+  end
+
+  local function jump_to_file()
+    local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
+    local start_line = file_start_lines[lnum]
+    if not start_line or not vim.api.nvim_win_is_valid(right_win) then
+      return
+    end
+    vim.api.nvim_set_current_win(right_win)
+    vim.api.nvim_win_set_cursor(right_win, { start_line + 1, 0 })
+    vim.cmd 'normal! zt'
+  end
+
+  local left_opts = { buffer = left_buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, left_opts)
+  vim.keymap.set('n', '<Esc>', close, left_opts)
+  vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
+  vim.keymap.set('n', '<Tab>', function()
+    if vim.api.nvim_win_is_valid(right_win) then
+      vim.api.nvim_set_current_win(right_win)
+    end
+  end, left_opts)
+
+  local right_opts = { buffer = right_buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, right_opts)
+  vim.keymap.set('n', '<Esc>', close, right_opts)
+  vim.keymap.set('n', '<Tab>', function()
+    if vim.api.nvim_win_is_valid(left_win) then
+      vim.api.nvim_set_current_win(left_win)
+    end
+  end, right_opts)
+end
+
+local function render_review_threads(buf, win, threads, ctx_id)
+  vim.bo[buf].filetype = ''
+  local content_w = vim.api.nvim_win_get_width(win) - 2
+
+  local lines = {}
+  local line_bgs = {}
+  local range_hls = {}
+
+  local function push_raw(text)
+    table.insert(lines, text)
+    return #lines - 1
+  end
+  local function push_bg(text, bg)
+    local idx = push_raw(text)
+    if bg then
+      table.insert(line_bgs, { line = idx, hl = bg })
+    end
+    return idx
+  end
+  local function push_seg(segs)
+    local text = ''
+    local local_hls = {}
+    for _, s in ipairs(segs) do
+      local col_start = #text
+      text = text .. s.text
+      if s.hl then
+        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+      end
+    end
+    local idx = push_raw(text)
+    for _, h in ipairs(local_hls) do
+      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    end
+    return idx
+  end
+  local function push_seg_with_bg(segs, bg)
+    local idx = push_seg(segs)
+    if bg then
+      table.insert(line_bgs, { line = idx, hl = bg })
+    end
+    return idx
+  end
 
   local unresolved = {}
   for _, t in ipairs(threads or {}) do
@@ -1579,50 +1978,140 @@ local function format_review_threads(threads, ctx_id)
     end
   end
 
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = 'REVIEW THREADS', hl = 'Title' },
+    { text = '  ' .. ctx_id, hl = 'Comment' },
+  }
+  push_raw('')
   if #unresolved == 0 then
-    table.insert(lines, '_No unresolved review threads._')
-    return table.concat(lines, '\n')
+    push_seg {
+      { text = '  ', hl = nil },
+      { text = '(no unresolved review threads)', hl = 'Comment' },
+    }
+  else
+    push_seg {
+      { text = '  ', hl = nil },
+      { text = ' ' .. #unresolved .. ' unresolved ', hl = 'DashboardPillWarn' },
+    }
   end
+  push_raw('')
+  push_raw('')
 
-  table.insert(lines, string.format('_%d unresolved %s_', #unresolved, #unresolved == 1 and 'thread' or 'threads'))
-  table.insert(lines, '')
+  local indent = '  '
+  local border_w = math.max(10, content_w - 6)
+  local bar_prefix = '  │  '
+  local bar_w = vim.fn.strdisplaywidth(bar_prefix)
+  local reply_border_w = math.max(10, content_w - bar_w - 4)
 
-  for _, t in ipairs(unresolved) do
+  for ti, t in ipairs(unresolved) do
     local cs = (t.comments and t.comments.nodes) or {}
     local first = cs[1]
-    local opened_by = (first and first.author and first.author.login) or '?'
     local path = t.path or '?'
     local line_num = t.line or t.originalLine or '?'
-    local tag = t.isOutdated and ' _[outdated]_' or ''
 
-    table.insert(lines, string.format('## %s:%s%s', path, tostring(line_num), tag))
-    if first then
-      table.insert(lines, string.format('_%s opened %s_', opened_by, ago(first.createdAt)))
+    -- Header card with file:line + diff hunk
+    push_seg {
+      { text = indent, hl = nil },
+      { text = '╭' .. string.rep('─', border_w) .. '╮', hl = 'DashboardAccentGithub' },
+    }
+    local header_segs = {
+      { text = indent, hl = nil },
+      { text = '  ', hl = nil },
+      { text = path .. ':' .. tostring(line_num), hl = 'Title' },
+    }
+    if t.isOutdated then
+      table.insert(header_segs, { text = '  ', hl = nil })
+      table.insert(header_segs, { text = ' outdated ', hl = 'DashboardPillMuted' })
     end
-    table.insert(lines, '')
-
+    push_seg(header_segs)
     if first and first.diffHunk and first.diffHunk ~= '' then
-      table.insert(lines, '```diff')
-      for _, l in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
-        table.insert(lines, l)
+      push_raw('')
+      for _, hl in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
+        local f = hl:sub(1, 1)
+        local hunk_bg
+        if hl:match '^@@' then
+          hunk_bg = 'DiffChange'
+        elseif f == '+' and not hl:match '^%+%+%+' then
+          hunk_bg = 'DiffAdd'
+        elseif f == '-' and not hl:match '^%-%-%-' then
+          hunk_bg = 'DiffDelete'
+        end
+        push_bg(indent .. '  ' .. hl, hunk_bg)
       end
-      table.insert(lines, '```')
-      table.insert(lines, '')
     end
+    push_seg {
+      { text = indent, hl = nil },
+      { text = '╰' .. string.rep('─', border_w) .. '╯', hl = 'DashboardAccentGithub' },
+    }
 
+    -- Comments as reply cards
     for _, c in ipairs(cs) do
-      table.insert(lines, string.format('**%s** · %s', (c.author and c.author.login) or '?', ago(c.createdAt)))
-      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
-        table.insert(lines, '> ' .. l)
+      local author = (c.author and c.author.login) or '?'
+      local age = ago(c.createdAt)
+      local prefix_w = bar_w + 2 + vim.fn.strdisplaywidth(author)
+      local age_w = vim.fn.strdisplaywidth(age)
+      local pad_w = content_w - prefix_w - age_w - 4
+      if pad_w < 2 then
+        pad_w = 2
       end
-      table.insert(lines, '')
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│', hl = 'DashboardAccentGithub' },
+      }
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentGithub' },
+        { text = '╭' .. string.rep('─', reply_border_w) .. '╮', hl = 'DashboardAccentGithub' },
+      }
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentGithub' },
+        { text = '  ', hl = nil },
+        { text = author, hl = 'Title' },
+        { text = string.rep(' ', pad_w), hl = nil },
+        { text = age, hl = 'Comment' },
+      }
+      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│  ', hl = 'DashboardAccentGithub' },
+          { text = '  ' .. l, hl = 'Normal' },
+        }
+      end
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentGithub' },
+        { text = '╰' .. string.rep('─', reply_border_w) .. '╯', hl = 'DashboardAccentGithub' },
+      }
     end
 
-    table.insert(lines, '---')
-    table.insert(lines, '')
+    if ti < #unresolved then
+      push_raw('')
+      push_raw('')
+    end
   end
 
-  return table.concat(lines, '\n')
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  for _, h in ipairs(range_hls) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  for _, bg in ipairs(line_bgs) do
+    vim.api.nvim_buf_set_extmark(buf, ns, bg.line, 0, {
+      end_line = bg.line + 1,
+      end_col = 0,
+      hl_group = bg.hl,
+      hl_eol = true,
+      priority = 10,
+    })
+  end
+  vim.bo[buf].modifiable = false
 end
 
 local function render_jira_issue(buf, win, issue)
@@ -1773,7 +2262,8 @@ local function render_jira_issue(buf, win, issue)
         { text = string.rep(' ', pad_w), hl = nil },
         { text = age, hl = 'Comment' },
       }
-      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+      local body_max = math.max(20, border_w - 4)
+      for _, l in ipairs(wrap_text(c.body or '', body_max)) do
         push_raw(indent .. '  ' .. l)
       end
       push_seg {
@@ -1812,7 +2302,8 @@ local function render_jira_issue(buf, win, issue)
         { text = string.rep(' ', pad_w), hl = nil },
         { text = age, hl = 'Comment' },
       }
-      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+      local body_max = math.max(20, border_w - 4)
+      for _, l in ipairs(wrap_text(c.body or '', body_max)) do
         push_seg {
           { text = '  ', hl = nil },
           { text = '│  ', hl = 'DashboardAccentJira' },
@@ -1900,13 +2391,13 @@ function M.threads_under_cursor()
     return
   end
   local title = string.format('Threads · %s#%d', m.pr.repo, m.pr.number)
-  local handle = open_result_window(title, nil, 'Loading review threads…')
+  vim.notify('Loading review threads…', vim.log.levels.INFO)
   require('dashboard.github').fetch_review_threads(m.pr.repo, m.pr.number, function(threads, err)
     if not threads then
-      handle.set_error(err or 'failed to fetch threads')
+      vim.notify('Failed to fetch threads: ' .. (err or 'unknown'), vim.log.levels.ERROR)
       return
     end
-    handle.set_content(format_review_threads(threads, m.pr.repo .. '#' .. m.pr.number))
+    open_threads_window(title, threads, m.pr.repo .. '#' .. m.pr.number)
   end)
 end
 
