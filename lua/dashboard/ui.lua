@@ -1506,15 +1506,16 @@ local function apply_diff_language_highlights(buf, body_lines, header_len)
   apply_ts_highlights_blocks(buf, diff_body_blocks(body_lines, header_len), 1)
 end
 
-local function open_diff_window(title, body, overview)
+local function open_diff_window(title, body, overview, opts)
+  opts = opts or {}
   on_viewer_open()
   clear_loading()
-  local files = parse_diff(body)
-  local body_lines = vim.split(body or '', '\n', { plain = true })
+  local files, body_lines, row_info
 
-  -- Width-independent: classify body lines, compute gutter widths.
-  local row_info = {}
-  do
+  local function parse_body(b)
+    files = parse_diff(b)
+    body_lines = vim.split(b or '', '\n', { plain = true })
+    row_info = {}
     local old_l, new_l = 0, 0
     local max_old, max_new = 1, 1
     for i, line in ipairs(body_lines) do
@@ -1553,7 +1554,12 @@ local function open_diff_window(title, body, overview)
     end
     row_info._max_old = max_old
     row_info._max_new = max_new
+    for _, f in ipairs(files) do
+      f._raw_start = f.start_line
+    end
   end
+
+  parse_body(body)
 
   local function compute_geom()
     local dash = compute_viewer_geom()
@@ -1710,10 +1716,6 @@ local function open_diff_window(title, body, overview)
     end
 
     apply_diff_language_highlights(right_buf, body_lines, header_len)
-  end
-
-  for _, f in ipairs(files) do
-    f._raw_start = f.start_line
   end
 
   local right_win = vim.api.nvim_open_win(right_buf, false, {
@@ -1929,11 +1931,44 @@ local function open_diff_window(title, body, overview)
     vim.cmd 'normal! zt'
   end
 
+  local refreshing = false
+  local function refresh()
+    if not opts.refresh_fn or refreshing then
+      return
+    end
+    refreshing = true
+    show_loading('Refreshing diff…')
+    opts.refresh_fn(function(new_body, err)
+      refreshing = false
+      clear_loading()
+      if err then
+        vim.notify('Refresh failed: ' .. err, vim.log.levels.ERROR)
+        return
+      end
+      if not new_body or new_body:gsub('%s', '') == '' then
+        vim.notify('No local changes', vim.log.levels.INFO)
+        return
+      end
+      parse_body(new_body)
+      local content_w = (left_win and vim.api.nvim_win_is_valid(left_win))
+          and geom.right_content_w
+        or (geom.total_w - 2)
+      render_right(content_w)
+      if left_win and vim.api.nvim_win_is_valid(left_win) then
+        pcall(vim.api.nvim_win_set_config, left_win, left_win_config())
+        render_left(geom.left_content_w)
+      end
+    end)
+  end
+
   local left_opts = { buffer = left_buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
   vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
   vim.keymap.set('n', '\\', toggle_files, left_opts)
+  if opts.refresh_fn then
+    vim.keymap.set('n', 'r', refresh, left_opts)
+  end
   vim.keymap.set('n', '<Tab>', function()
     if vim.api.nvim_win_is_valid(right_win) then
       vim.api.nvim_set_current_win(right_win)
@@ -1944,6 +1979,9 @@ local function open_diff_window(title, body, overview)
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
   vim.keymap.set('n', '\\', toggle_files, right_opts)
+  if opts.refresh_fn then
+    vim.keymap.set('n', 'r', refresh, right_opts)
+  end
   vim.keymap.set('n', '<Tab>', function()
     if not left_win or not vim.api.nvim_win_is_valid(left_win) then
       toggle_files()
@@ -3031,16 +3069,14 @@ function M.threads_under_cursor()
   end)
 end
 
-function M.show_local_diff()
-  if diff_viewer_open() then
-    focus_diff_viewer()
-    return
-  end
+-- Fetch local diff (vs upstream, fallback HEAD) including untracked files.
+-- Callback receives (diff_text, err, label). diff_text is '' for no changes.
+local function fetch_local_diff(callback)
   local cwd = vim.fn.getcwd()
   vim.system({ 'git', '-C', cwd, 'rev-parse', '--is-inside-work-tree' }, { text = true }, function(check)
     vim.schedule(function()
       if check.code ~= 0 then
-        vim.notify('Not inside a git repository', vim.log.levels.WARN)
+        callback(nil, 'Not inside a git repository', nil)
         return
       end
       vim.system(
@@ -3056,7 +3092,6 @@ function M.show_local_diff()
               target = 'HEAD'
               label = 'HEAD'
             end
-            show_loading('Loading local diff vs ' .. label .. '…')
             local results = { tracked = nil, untracked = nil }
             local pending = 2
             local function done()
@@ -3065,19 +3100,12 @@ function M.show_local_diff()
                 return
               end
               local diff = (results.tracked or '') .. (results.untracked or '')
-              if diff:gsub('%s', '') == '' then
-                vim.notify('No local changes vs ' .. label, vim.log.levels.INFO)
-                return
-              end
-              local branch = vim.fn.fnamemodify(cwd, ':t')
-              local title = string.format('%s · local vs %s', branch, label)
-              open_diff_window(title, diff, nil)
+              callback(diff, nil, label)
             end
 
             vim.system({ 'git', '-C', cwd, 'diff', target }, { text = true }, function(obj)
               vim.schedule(function()
                 if obj.code ~= 0 then
-                  vim.notify('git diff failed: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
                   results.tracked = ''
                 else
                   results.tracked = obj.stdout or ''
@@ -3113,7 +3141,6 @@ function M.show_local_diff()
                       { text = true },
                       function(d)
                         vim.schedule(function()
-                          -- exit code 1 means files differ, which is expected; >1 is real error
                           if (d.code == 0 or d.code == 1) and d.stdout and d.stdout ~= '' then
                             chunks[i] = d.stdout
                           else
@@ -3141,6 +3168,35 @@ function M.show_local_diff()
         end
       )
     end)
+  end)
+end
+
+function M.show_local_diff()
+  if diff_viewer_open() then
+    focus_diff_viewer()
+    return
+  end
+  show_loading('Loading local diff…')
+  fetch_local_diff(function(diff, err, label)
+    if err then
+      clear_loading()
+      vim.notify(err, vim.log.levels.WARN)
+      return
+    end
+    if not diff or diff:gsub('%s', '') == '' then
+      clear_loading()
+      vim.notify('No local changes vs ' .. (label or '?'), vim.log.levels.INFO)
+      return
+    end
+    local branch = vim.fn.fnamemodify(vim.fn.getcwd(), ':t')
+    local title = string.format('%s · local vs %s', branch, label)
+    open_diff_window(title, diff, nil, {
+      refresh_fn = function(cb)
+        fetch_local_diff(function(new_diff, new_err)
+          cb(new_diff, new_err)
+        end)
+      end,
+    })
   end)
 end
 
@@ -3495,6 +3551,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   <CR>    jump to selected file's hunk + focus right pane (files pane)
   <Tab>   toggle focus (files ↔ content); re-opens files if hidden
   \       toggle the file explorer pane (full-screen the content)
+  r       refresh (local diff viewer only)
   q       close both panes
 
 ## Claude / threads window
