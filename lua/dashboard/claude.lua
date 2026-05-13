@@ -83,27 +83,6 @@ local function call_claude(prompt, callback)
   end)
 end
 
-local function adf_to_text(node)
-  if type(node) ~= 'table' then
-    return ''
-  end
-  local out = {}
-  if node.type == 'text' and node.text then
-    table.insert(out, node.text)
-  end
-  for _, child in ipairs(node.content or {}) do
-    table.insert(out, adf_to_text(child))
-  end
-  local result = table.concat(out, '')
-  if node.type == 'paragraph' or node.type == 'heading' then
-    result = result .. '\n\n'
-  elseif node.type == 'listItem' then
-    result = '- ' .. result .. '\n'
-  elseif node.type == 'codeBlock' then
-    result = '```\n' .. result .. '\n```\n'
-  end
-  return result
-end
 
 local function fetch_pr_context(meta, callback)
   local url = meta.url
@@ -237,74 +216,19 @@ local function fetch_pr_context(meta, callback)
   end
 end
 
-local function jira_creds()
-  local email = vim.env.JIRA_EMAIL
-  local token = vim.env.JIRA_API_TOKEN
-  if not email or email == '' or not token or token == '' then
-    return nil
-  end
-  return vim.base64.encode(email .. ':' .. token)
-end
-
 local function fetch_jira_context(meta, callback)
   local key = meta.key
   if not key then
     callback(nil, 'no jira key')
     return
   end
-  local auth = jira_creds()
-  if not auth then
-    callback(nil, 'JIRA_EMAIL or JIRA_API_TOKEN not set')
-    return
-  end
-
-  vim.system({
-    'curl',
-    '-sS',
-    '-G',
-    config.jira_base_url .. '/rest/api/3/issue/' .. key,
-    '--data-urlencode',
-    'fields=summary,description,status,priority,issuetype,reporter,assignee,labels,comment',
-    '-H',
-    'Authorization: Basic ' .. auth,
-    '-H',
-    'Accept: application/json',
-  }, { text = true }, function(obj)
-    vim.schedule(function()
-      if obj.code ~= 0 then
-        callback(nil, 'curl failed')
-        return
-      end
-      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
-      if not ok or type(parsed) ~= 'table' then
-        callback(nil, 'json parse error')
-        return
-      end
-      if parsed.errorMessages and #parsed.errorMessages > 0 then
-        callback(nil, table.concat(parsed.errorMessages, '; '))
-        return
-      end
-      local f = parsed.fields or {}
-      local comments = {}
-      for _, c in ipairs((f.comment and f.comment.comments) or {}) do
-        local body = adf_to_text(c.body)
-        local author = (c.author and c.author.displayName) or '?'
-        table.insert(comments, string.format('%s:\n%s', author, body))
-      end
-      callback {
-        kind = 'jira',
-        key = key,
-        title = f.summary,
-        description = adf_to_text(f.description),
-        status = (f.status and f.status.name) or '?',
-        priority = (f.priority and f.priority.name) or '?',
-        type = (f.issuetype and f.issuetype.name) or '?',
-        reporter = (f.reporter and f.reporter.displayName) or '?',
-        assignee = (f.assignee and f.assignee.displayName) or '?',
-        labels = f.labels or {},
-        comments = comments,
-      }
-    end)
+  require('dashboard.jira').fetch_issue(key, function(issue, err)
+    if not issue then
+      callback(nil, err)
+      return
+    end
+    issue.kind = 'jira'
+    callback(issue)
   end)
 end
 
@@ -392,7 +316,16 @@ Description:
 end
 
 local function format_jira_context(ctx)
-  local comments_text = (ctx.comments and #ctx.comments > 0) and table.concat(ctx.comments, '\n---\n') or '(no comments)'
+  local comments_text
+  if ctx.comments and #ctx.comments > 0 then
+    local strs = {}
+    for _, c in ipairs(ctx.comments) do
+      table.insert(strs, c.author .. ':\n' .. (c.body or ''))
+    end
+    comments_text = table.concat(strs, '\n---\n')
+  else
+    comments_text = '(no comments)'
+  end
   return string.format(
     [[<jira_context>
 Issue: %s
@@ -462,6 +395,10 @@ function M.analyze(meta, prompt_key, callback)
       }
     end)
   end)
+end
+
+function M.fetch_jira(meta, callback)
+  fetch_jira_context(meta, callback)
 end
 
 return M

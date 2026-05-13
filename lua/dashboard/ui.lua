@@ -16,11 +16,80 @@ local state = {
 }
 
 local pending_hls = {}
+local pending_line_bgs = {}
+local pending_sections = {}
+local pending_subsections = {}
+local current_section_accent = nil
+local cursor_ns = vim.api.nvim_create_namespace 'dashboard_cursor'
 
 local open_result_window
+local stop_spinner
 
 local PAD = '   '
 local BAR = '┃'
+
+local SECTION_ICONS = {
+  GitHub = '',
+  Notifications = '',
+  Jira = '',
+  Notes = '',
+}
+
+local function setup_hl()
+  local function set(name, opts)
+    opts.default = true
+    vim.api.nvim_set_hl(0, name, opts)
+  end
+  set('DashboardPillWarn', { bg = '#5a4a1c', fg = '#ffe48a' })
+  set('DashboardPillInfo', { bg = '#1c3a5a', fg = '#88c8f0' })
+  set('DashboardPillError', { bg = '#5a1c1c', fg = '#ff9a9a' })
+  set('DashboardPillOk', { bg = '#1c5a2e', fg = '#88e8a0' })
+  set('DashboardPillMuted', { bg = '#3a3f4d', fg = '#b0b8c5' })
+  set('DashboardPillReview', { bg = '#3a2a5a', fg = '#c8a8ff' })
+  set('DashboardPillQA', { bg = '#1c4a5a', fg = '#88e0e8' })
+  set('DashboardPillRefinement', { bg = '#4a3a1c', fg = '#e8c890' })
+  set('DashboardAccentGithub', { fg = '#88c0e0' })
+  set('DashboardAccentNotifs', { fg = '#e0d088' })
+  set('DashboardAccentJira', { fg = '#88d090' })
+  set('DashboardAccentNotes', { fg = '#e088a0' })
+  set('DashboardNormal', { bg = '#12141c' })
+  set('DashboardCursorLine', { bg = '#3d4570' })
+  set('DashboardFloatBorder', { fg = '#3a3f50', bg = '#12141c' })
+  set('DashboardSectionBg', { bg = '#2a3045' })
+  set('DashboardCardBg', { bg = '#181c26' })
+  set('DashboardCardBgAlt', { bg = '#262d3f' })
+end
+
+local SECTION_COLORS = {
+  GitHub = 'DashboardAccentGithub',
+  Notifications = 'DashboardAccentNotifs',
+  Jira = 'DashboardAccentJira',
+  Notes = 'DashboardAccentNotes',
+}
+
+local function section_color(label)
+  for key, color in pairs(SECTION_COLORS) do
+    if label == key or label:sub(1, #key + 1) == (key .. ' ') then
+      return color
+    end
+  end
+  return '@function'
+end
+
+setup_hl()
+vim.api.nvim_create_autocmd('ColorScheme', {
+  pattern = '*',
+  callback = setup_hl,
+})
+
+local function section_icon(label)
+  for key, icon in pairs(SECTION_ICONS) do
+    if label == key or label:sub(1, #key + 1) == (key .. ' ') then
+      return icon
+    end
+  end
+  return nil
+end
 
 local config = {
   repo_paths = {},
@@ -108,16 +177,16 @@ local function relative_time(iso)
 end
 
 local NOTIFICATION_REASON = {
-  mention = { label = '@mention', hl = 'DiagnosticInfo' },
-  team_mention = { label = 'team @', hl = 'DiagnosticInfo' },
-  review_requested = { label = 'review', hl = '@keyword' },
-  assign = { label = 'assign', hl = '@keyword' },
-  author = { label = 'author', hl = 'Comment' },
-  comment = { label = 'comment', hl = 'Comment' },
-  subscribed = { label = 'watching', hl = 'NonText' },
-  state_change = { label = 'state', hl = 'NonText' },
-  security_alert = { label = 'security', hl = 'DiagnosticError' },
-  ci_activity = { label = 'ci', hl = 'DiagnosticWarn' },
+  mention = { label = '@mention', hl = 'DashboardPillInfo' },
+  team_mention = { label = 'team @', hl = 'DashboardPillInfo' },
+  review_requested = { label = 'review', hl = 'DashboardPillInfo' },
+  assign = { label = 'assign', hl = 'DashboardPillInfo' },
+  author = { label = 'author', hl = 'DashboardPillMuted' },
+  comment = { label = 'comment', hl = 'DashboardPillMuted' },
+  subscribed = { label = 'watching', hl = 'DashboardPillMuted' },
+  state_change = { label = 'state', hl = 'DashboardPillMuted' },
+  security_alert = { label = 'security', hl = 'DashboardPillError' },
+  ci_activity = { label = 'ci', hl = 'DashboardPillWarn' },
 }
 
 local function notification_reason(reason)
@@ -156,9 +225,17 @@ local function flush_hls()
     vim.api.nvim_buf_set_extmark(state.buf, ns, h.line, h.col_start, {
       end_col = h.col_end,
       hl_group = h.group,
+      priority = 100,
     })
   end
   pending_hls = {}
+  for _, h in ipairs(pending_line_bgs) do
+    vim.api.nvim_buf_set_extmark(state.buf, ns, h.line, 0, {
+      line_hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  pending_line_bgs = {}
 end
 
 local function emit_blank(lines)
@@ -166,38 +243,72 @@ local function emit_blank(lines)
 end
 
 local function emit_divider(lines, label)
-  local total = 78
-  local label_part = '  ' .. label .. '  '
-  local side = math.floor((total - #label_part) / 2)
-  local left = string.rep('━', side)
-  local right = string.rep('━', total - side - #label_part)
-  local idx, cols = emit(lines, {
+  local section, suffix = label:match '^(.-) · (.*)$'
+  if not section then
+    section = label
+    suffix = nil
+  end
+  emit_blank(lines)
+  local accent = section_color(label)
+  current_section_accent = accent
+  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
+  local rule_idx, rule_cols = emit(lines, {
     { text = ' ', hl = nil },
-    { text = left, hl = 'NonText' },
-    { text = '  ', hl = nil },
-    { text = label, hl = 'Title' },
-    { text = '  ', hl = nil },
-    { text = right, hl = 'NonText' },
+    { text = string.rep('─', math.max(10, win_w - 2)), hl = accent },
   })
+  paint(rule_idx, rule_cols)
+
+  local icon = vim.g.have_nerd_font and section_icon(label) or nil
+  local segments = {
+    { text = ' ', hl = nil },
+    { text = '▎  ', hl = accent },
+  }
+  if icon then
+    table.insert(segments, { text = icon, hl = accent })
+    table.insert(segments, { text = '   ', hl = nil })
+  end
+  table.insert(segments, { text = section:upper(), hl = 'Title' })
+  if suffix then
+    table.insert(segments, { text = '   ' .. suffix, hl = 'Comment' })
+  end
+  local idx, cols = emit(lines, segments)
   paint(idx, cols)
+  table.insert(pending_line_bgs, { line = idx, hl = 'DashboardSectionBg' })
+  table.insert(pending_sections, idx)
 end
 
-local function emit_subhead(lines, title, count)
-  local count_str = count and string.format('  (%d)', count) or ''
-  local idx, cols = emit(lines, {
-    { text = '  ', hl = nil },
-    { text = title, hl = '@keyword' },
-    { text = count_str, hl = 'Comment' },
-  })
+local function emit_subhead(lines, title, count, pill_hl)
+  local count_str = count and tostring(count) or ''
+  local segments = { { text = '  ', hl = nil } }
+  if pill_hl then
+    local inner = count_str ~= '' and (count_str .. '  ' .. title) or title
+    table.insert(segments, { text = ' ' .. inner .. ' ', hl = pill_hl })
+  else
+    if count_str ~= '' then
+      table.insert(segments, { text = count_str .. '  ', hl = '@number' })
+    end
+    table.insert(segments, { text = title, hl = '@keyword' })
+  end
+  local idx, cols = emit(lines, segments)
   paint(idx, cols)
+  table.insert(pending_subsections, idx)
 end
+
+local SPINNER_FRAMES = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+local spinner_state = { timer = nil, frame_i = 1 }
 
 local function emit_status(lines, kind, text)
   local hl = kind == 'loading' and 'Comment' or kind == 'error' and 'DiagnosticError' or 'Comment'
-  local prefix = kind == 'loading' and '…' or kind == 'error' and '✗' or '·'
+  local prefix
+  if kind == 'loading' then
+    prefix = SPINNER_FRAMES[spinner_state.frame_i]
+  elseif kind == 'error' then
+    prefix = '✗'
+  else
+    prefix = '·'
+  end
   local idx, cols = emit(lines, {
-    { text = PAD, hl = nil },
-    { text = BAR .. ' ', hl = 'NonText' },
+    { text = '    ', hl = nil },
     { text = prefix .. ' ', hl = hl },
     { text = text, hl = hl },
   })
@@ -383,6 +494,41 @@ local function jira_status_hl(status)
   return '@constant'
 end
 
+local function jira_status_pill(status)
+  local s = (status or ''):lower()
+  if s:find 'passed' then
+    return 'DashboardPillOk'
+  end
+  if s:find 'progress' then
+    return 'DashboardPillWarn'
+  end
+  if s:find 'peer review' or s:find 'code review' then
+    return 'DashboardPillReview'
+  end
+  if s:find 'qa' then
+    return 'DashboardPillQA'
+  end
+  if s:find 'refinement' then
+    return 'DashboardPillRefinement'
+  end
+  if s:find 'block' or s:find 'impedi' or s:find 'hold' then
+    return 'DashboardPillError'
+  end
+  if s:find 'done' or s:find 'closed' or s:find 'resolved' then
+    return 'DashboardPillOk'
+  end
+  return 'DashboardPillMuted'
+end
+
+local function emit_repo_header(lines, name, count)
+  local idx, cols = emit(lines, {
+    { text = '    ', hl = nil },
+    { text = tostring(count) .. '  ', hl = '@number' },
+    { text = name, hl = '@string' },
+  })
+  paint(idx, cols)
+end
+
 local function emit_pr(lines, meta, pr, opts)
   opts = opts or {}
   local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
@@ -390,22 +536,43 @@ local function emit_pr(lines, meta, pr, opts)
   local ci_glyph, ci_hl = ci_badge(pr.ciStatus)
   local rv_glyph, rv_hl = review_badge(pr.reviewDecision, pr.approvalCount)
   local age_label, age_hl = relative_time(pr.updatedAt)
+  local short_repo = repo:match '/(.+)$' or repo
+  local is_draft = opts.draft and pr.isDraft
+
+  local indent = opts.deep_indent and '      ' or '    '
+  local prefix_w = vim.fn.strdisplaywidth(indent) + 1 + 1 + 1 + 2
+  local draft_w = is_draft and 9 or 0
+  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
+
+  local repo_text = opts.skip_repo and num or (short_repo .. num)
+  local meta_w = 5 + vim.fn.strdisplaywidth(repo_text) + 5 + vim.fn.strdisplaywidth(age_label or '')
+
+  local title = pr.title or ''
+  local title_max = win_w - prefix_w - meta_w - draft_w - 3
+  if title_max < 20 then
+    title_max = 20
+  end
+  if vim.fn.strdisplaywidth(title) > title_max then
+    title = title:sub(1, title_max - 1) .. '…'
+  end
+
   local segments = {
-    { text = PAD, hl = nil },
-    { text = BAR .. ' ', hl = 'NonText' },
-    { text = pad_right(num, 8), hl = '@number' },
+    { text = indent, hl = nil },
     { text = ci_glyph, hl = ci_hl },
     { text = ' ', hl = nil },
     { text = rv_glyph, hl = rv_hl },
     { text = '  ', hl = nil },
-    { text = pad_right(repo, 30), hl = '@string' },
-    { text = string.format('%5s', age_label), hl = age_hl },
-    { text = '  ', hl = nil },
-    { text = pr.title, hl = 'Normal' },
+    { text = title, hl = 'Normal' },
+    { text = '  ·  ', hl = 'NonText' },
+    { text = repo_text, hl = 'Comment' },
+    { text = '  ·  ', hl = 'NonText' },
+    { text = age_label, hl = age_hl },
   }
-  if opts.draft and pr.isDraft then
-    table.insert(segments, { text = '  [draft]', hl = 'Comment' })
+  if is_draft then
+    table.insert(segments, { text = '  ', hl = nil })
+    table.insert(segments, { text = ' draft ', hl = 'DashboardPillMuted' })
   end
+
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
   meta[idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo }, kind = 'pr' }
@@ -413,7 +580,7 @@ local function emit_pr(lines, meta, pr, opts)
   if pr.unresolvedThreads and pr.unresolvedThreads > 0 then
     local sidx, scols = emit(lines, {
       { text = '       ┊ ', hl = 'NonText' },
-      { text = tostring(pr.unresolvedThreads) .. ' unresolved', hl = 'DiagnosticWarn' },
+      { text = ' ' .. tostring(pr.unresolvedThreads) .. ' unresolved ', hl = 'DashboardPillWarn' },
     })
     paint(sidx, scols)
   end
@@ -421,49 +588,58 @@ end
 
 local function emit_issue(lines, meta, issue, opts)
   opts = opts or {}
+  local QA_SECTIONS = { ['Needs QA'] = true, ['In QA'] = true, ['Passed QA'] = true }
+  local show_qa = QA_SECTIONS[opts.section_status or ''] or opts.show_status
+
+  local indent = '    '
+  local key_padded = pad_right(issue.key, 13)
+  local title = issue.summary or ''
+
   local segments = {
-    { text = PAD, hl = nil },
-    { text = BAR .. ' ', hl = 'NonText' },
-    { text = pad_right(issue.key, 13), hl = '@number' },
+    { text = indent, hl = nil },
+    { text = key_padded, hl = '@number' },
+    { text = '  ', hl = nil },
+    { text = title, hl = 'Normal' },
   }
-  if opts.show_status then
-    local hl = jira_status_hl(issue.status)
-    table.insert(segments, { text = pad_right('[' .. (issue.status or '?') .. ']', 20), hl = hl })
+
+  if issue.status_change_at then
+    local age_label, age_hl = relative_time(issue.status_change_at)
+    if age_label and age_label ~= '' then
+      table.insert(segments, { text = '  ·  ', hl = 'NonText' })
+      table.insert(segments, { text = age_label, hl = age_hl })
+    end
   end
-  table.insert(segments, { text = issue.summary or '', hl = 'Normal' })
+
+  if issue.comment_count and issue.comment_count > 0 then
+    local glyph = vim.g.have_nerd_font and '' or 'c'
+    table.insert(segments, { text = '  ·  ', hl = 'NonText' })
+    table.insert(segments, { text = tostring(issue.comment_count) .. ' ' .. glyph, hl = 'Comment' })
+  end
+
+  if opts.show_status then
+    local pill_hl = jira_status_pill(issue.status)
+    table.insert(segments, { text = '  ', hl = nil })
+    table.insert(segments, { text = ' ' .. (issue.status or '?') .. ' ', hl = pill_hl })
+  end
+
+  if show_qa and issue.qa_assignee then
+    table.insert(segments, { text = '  ', hl = nil })
+    table.insert(segments, { text = ' QA: ' .. issue.qa_assignee .. ' ', hl = 'DashboardPillInfo' })
+  end
+
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
   meta[idx + 1] = { url = issue.url, kind = 'jira', key = issue.key }
 
-  local sub = { { text = '       ┊ ', hl = 'NonText' } }
-  local has_meta = false
-  if issue.qa_assignee then
-    table.insert(sub, { text = 'QA: ', hl = 'Comment' })
-    table.insert(sub, { text = issue.qa_assignee, hl = '@string' })
-    has_meta = true
-  end
-  if issue.status_change_at then
-    if has_meta then
-      table.insert(sub, { text = '  ·  ', hl = 'Identifier' })
-    end
-    local age, age_hl = relative_time(issue.status_change_at)
-    table.insert(sub, { text = 'in status ', hl = 'Comment' })
-    table.insert(sub, { text = age, hl = age_hl })
-    has_meta = true
-  end
-  if has_meta then
-    local sidx, scols = emit(lines, sub)
-    paint(sidx, scols)
-  end
-
   local matches = related_prs(issue.key, opts.pr_pool or {})
   for _, pr in ipairs(matches) do
     local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
+    local short = repo:match '/(.+)$' or repo
+    local repo_num = short .. '#' .. pr.number
     local sub_idx, sub_cols = emit(lines, {
       { text = '       ', hl = nil },
       { text = '↳ ', hl = 'NonText' },
-      { text = pad_right(repo .. '#' .. pr.number, 30), hl = '@string' },
-      { text = pr.title or '', hl = 'Comment' },
+      { text = repo_num, hl = '@string' },
     })
     paint(sub_idx, sub_cols)
     meta[sub_idx + 1] = { url = pr.url, pr = { number = pr.number, repo = repo }, kind = 'pr' }
@@ -473,11 +649,17 @@ end
 local function emit_notification(lines, meta, n)
   local label, hl = notification_reason(n.reason)
   local age_label, age_hl = relative_time(n.updated_at)
+  local pill_text = ' ' .. label .. ' '
+  local pill_w = 14
+  local pill_pad = pill_w - #pill_text
+  if pill_pad < 1 then
+    pill_pad = 1
+  end
   local idx, cols = emit(lines, {
-    { text = PAD, hl = nil },
-    { text = BAR .. ' ', hl = 'NonText' },
-    { text = pad_right(n.repo or '?', 30), hl = '@string' },
-    { text = pad_right(label, 12), hl = hl },
+    { text = '    ', hl = nil },
+    { text = pill_text, hl = hl },
+    { text = string.rep(' ', pill_pad), hl = nil },
+    { text = pad_right(n.repo or '?', 30), hl = 'Comment' },
     { text = string.format('%5s', age_label), hl = age_hl },
     { text = '  ', hl = nil },
     { text = n.title or '', hl = 'Normal' },
@@ -499,9 +681,24 @@ local function emit_notification(lines, meta, n)
   }
 end
 
-local function emit_section(lines, meta, title, items, emit_item, empty_label)
+local function subsection_box(lines, kind)
+  if not current_section_accent then
+    return
+  end
+  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
+  local box_w = math.max(10, win_w - 4)
+  local chars = kind == 'top' and ('╭' .. string.rep('─', box_w) .. '╮') or ('╰' .. string.rep('─', box_w) .. '╯')
+  local idx, cols = emit(lines, {
+    { text = ' ', hl = nil },
+    { text = chars, hl = current_section_accent },
+  })
+  paint(idx, cols)
+end
+
+local function emit_section(lines, meta, title, items, emit_item, empty_label, opts)
   local count = type(items) == 'table' and #items or nil
-  emit_subhead(lines, title, count)
+  subsection_box(lines, 'top')
+  emit_subhead(lines, title, count, opts and opts.pill_hl or nil)
   if items == nil then
     emit_status(lines, 'loading', 'Loading…')
   elseif items == false then
@@ -515,6 +712,7 @@ local function emit_section(lines, meta, title, items, emit_item, empty_label)
       emit_item(lines, meta, item)
     end
   end
+  subsection_box(lines, 'bottom')
   emit_blank(lines)
 end
 
@@ -522,6 +720,50 @@ local function emit_segments(lines, segments)
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
   return idx
+end
+
+local function emit_pr_section(lines, meta, title, prs, empty_label, pr_opts)
+  local count = type(prs) == 'table' and #prs or nil
+  subsection_box(lines, 'top')
+  emit_subhead(lines, title, count, 'DashboardPillInfo')
+  if prs == nil then
+    emit_status(lines, 'loading', 'Loading…')
+  elseif prs == false then
+    emit_status(lines, 'error', 'Failed to load')
+  elseif type(prs) == 'string' then
+    emit_status(lines, 'error', prs)
+  elseif #prs == 0 then
+    emit_status(lines, 'empty', empty_label or 'Nothing here')
+  else
+    local groups = {}
+    local order = {}
+    for _, pr in ipairs(prs) do
+      local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
+      local short = repo:match '/(.+)$' or repo
+      if not groups[short] then
+        groups[short] = {}
+        table.insert(order, short)
+      end
+      table.insert(groups[short], pr)
+    end
+    for i, repo_name in ipairs(order) do
+      if i > 1 then
+        emit_blank(lines)
+      end
+      emit_repo_header(lines, repo_name, #groups[repo_name])
+      for _, pr in ipairs(groups[repo_name]) do
+        local pr_inner_opts = { skip_repo = true, deep_indent = true }
+        if pr_opts then
+          for k, v in pairs(pr_opts) do
+            pr_inner_opts[k] = v
+          end
+        end
+        emit_pr(lines, meta, pr, pr_inner_opts)
+      end
+    end
+  end
+  subsection_box(lines, 'bottom')
+  emit_blank(lines)
 end
 
 local function emit_legend(lines, segments)
@@ -538,27 +780,16 @@ local GAP = { text = '   ', hl = nil }
 
 local function emit_header(lines)
   emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
-  emit_legend(lines, {
-    OPEN_BR,
-    { text = '<CR>', hl = '@keyword' },
-    { text = ' open · ', hl = 'Comment' },
-    { text = 'y', hl = '@keyword' },
-    { text = ' yank · ', hl = 'Comment' },
-    { text = 'f', hl = '@keyword' },
-    { text = ' filter · ', hl = 'Comment' },
-    { text = 'r', hl = '@keyword' },
-    { text = ' refresh · ', hl = 'Comment' },
-    { text = 'q', hl = '@keyword' },
-    { text = ' close', hl = 'Comment' },
-    CLOSE_BR,
+  emit_segments(lines, {
+    { text = '  ', hl = nil },
+    { text = 'g?', hl = '@keyword' },
+    { text = ' keymaps', hl = 'Comment' },
   })
   if state.filter and state.filter ~= '' then
-    emit_legend(lines, {
-      { text = 'Filter: ', hl = 'Comment' },
+    emit_segments(lines, {
+      { text = '  ', hl = nil },
+      { text = 'filter: ', hl = 'Comment' },
       { text = state.filter, hl = '@string' },
-      { text = '   (', hl = 'Comment' },
-      { text = 'f', hl = '@keyword' },
-      { text = ' edit · empty to clear)', hl = 'Comment' },
     })
   end
   emit_blank(lines)
@@ -591,6 +822,8 @@ local function emit_github_legend(lines)
     OPEN_BR,
     { text = 'c', hl = '@keyword' },
     { text = ' checkout · ', hl = 'Comment' },
+    { text = 'i', hl = '@keyword' },
+    { text = ' claude · ', hl = 'Comment' },
     { text = 'D', hl = '@keyword' },
     { text = ' diff · ', hl = 'Comment' },
     { text = 't', hl = '@keyword' },
@@ -664,18 +897,13 @@ local function note_segments(line, kind)
   return { { text = line, hl = 'Normal' } }
 end
 
-local function emit_notes_section(lines, meta, filter)
-  local notes_mod = require 'dashboard.notes'
-  local path = notes_mod.path_for_today()
-  local raw = notes_mod.read_today()
-
+local function parse_note_entries(raw, filter)
   local entries = {}
-  for i, line in ipairs(raw) do
+  for i, line in ipairs(raw or {}) do
     if line and line:gsub('%s', '') ~= '' then
       table.insert(entries, { text = line, file_line = i, kind = note_kind(line) })
     end
   end
-
   if filter and filter ~= '' then
     local kept = {}
     for _, e in ipairs(entries) do
@@ -685,38 +913,62 @@ local function emit_notes_section(lines, meta, filter)
     end
     entries = kept
   end
-
   table.sort(entries, function(a, b)
     if rank_kind(a.kind) ~= rank_kind(b.kind) then
       return rank_kind(a.kind) < rank_kind(b.kind)
     end
     return a.file_line < b.file_line
   end)
+  return entries
+end
 
-  emit_divider(lines, 'Notes · ' .. os.date '%Y-%m-%d')
-  emit_notes_legend(lines)
+local function render_note_entries(lines, meta, path, entries)
+  for _, e in ipairs(entries) do
+    local segs = { { text = '    ', hl = nil } }
+    for _, s in ipairs(note_segments(e.text, e.kind)) do
+      table.insert(segs, s)
+    end
+    local idx, cols = emit(lines, segs)
+    paint(idx, cols)
+    meta[idx + 1] = { kind = 'note', path = path, file_line = e.file_line, todo_kind = e.kind }
+  end
+end
+
+local function emit_notes_section(lines, meta, filter)
+  local notes_mod = require 'dashboard.notes'
+  local today_path = notes_mod.path_for_today()
+  local today_entries = parse_note_entries(notes_mod.read_today(), filter)
+
+  emit_divider(lines, 'Notes')
   emit_blank(lines)
 
-  if #entries == 0 then
+  if #today_entries == 0 then
     local msg = (filter and filter ~= '') and '(no matching notes)' or '(no notes yet — press n to add one)'
     local idx, cols = emit(lines, {
-      { text = PAD, hl = nil },
-      { text = BAR .. ' ', hl = 'NonText' },
+      { text = '    ', hl = nil },
       { text = msg, hl = 'Comment' },
     })
     paint(idx, cols)
-    meta[idx + 1] = { kind = 'note', path = path }
+    meta[idx + 1] = { kind = 'note', path = today_path }
   else
-    for _, e in ipairs(entries) do
-      local segs = { { text = PAD, hl = nil }, { text = BAR .. ' ', hl = 'NonText' } }
-      for _, s in ipairs(note_segments(e.text, e.kind)) do
-        table.insert(segs, s)
-      end
-      local idx, cols = emit(lines, segs)
+    render_note_entries(lines, meta, today_path, today_entries)
+  end
+
+  local prev_path, prev_date = notes_mod.find_previous(os.date '%Y-%m-%d')
+  if prev_path then
+    local prev_entries = parse_note_entries(notes_mod.read_file(prev_path), filter)
+    if #prev_entries > 0 then
+      emit_blank(lines)
+      local idx, cols = emit(lines, {
+        { text = '  Previous · ', hl = 'Comment' },
+        { text = prev_date or '', hl = '@string' },
+      })
       paint(idx, cols)
-      meta[idx + 1] = { kind = 'note', path = path, file_line = e.file_line, todo_kind = e.kind }
+      meta[idx + 1] = { kind = 'note', path = prev_path }
+      render_note_entries(lines, meta, prev_path, prev_entries)
     end
   end
+
   emit_blank(lines)
 end
 
@@ -752,6 +1004,10 @@ local function render()
   local lines = {}
   local meta = {}
   pending_hls = {}
+  pending_line_bgs = {}
+  pending_sections = {}
+  pending_subsections = {}
+  current_section_accent = nil
 
   sort_prs_by_repo(state.data.my_prs)
   sort_prs_by_repo(state.data.reviews)
@@ -780,24 +1036,17 @@ local function render()
   emit_header(lines)
   emit_notes_section(lines, meta, f)
   emit_divider(lines, 'GitHub')
-  emit_github_legend(lines)
   emit_blank(lines)
-  emit_section(lines, meta, 'My PRs', my_prs, function(ls, m, pr)
-    emit_pr(ls, m, pr, { draft = true })
-  end, 'No open PRs')
-  emit_section(lines, meta, 'Awaiting my review', reviews, function(ls, m, pr)
-    emit_pr(ls, m, pr)
-  end, 'Inbox zero')
+  emit_pr_section(lines, meta, 'My PRs', my_prs, 'No open PRs', { draft = true })
+  emit_pr_section(lines, meta, 'Awaiting my review', reviews, 'Inbox zero', {})
 
   emit_divider(lines, 'Notifications')
-  emit_notifications_legend(lines)
   emit_blank(lines)
   emit_section(lines, meta, 'Inbox', notifications, function(ls, m, n)
     emit_notification(ls, m, n)
   end, 'No notifications')
 
   emit_divider(lines, 'Jira')
-  emit_jira_legend(lines)
   emit_blank(lines)
   local active = jira_active
   if active == nil then
@@ -812,13 +1061,21 @@ local function render()
       table.insert(groups[s], issue)
     end
     local seen = {}
+    local function sort_by_has_pr(list)
+      table.sort(list, function(a, b)
+        local ha = #related_prs(a.key, pr_pool) > 0
+        local hb = #related_prs(b.key, pr_pool) > 0
+        return ha and not hb
+      end)
+    end
     for _, status in ipairs(config.jira_status_order) do
       seen[status] = true
       local items = groups[status]
       if items and #items > 0 then
+        sort_by_has_pr(items)
         emit_section(lines, meta, status, items, function(ls, m, issue)
-          emit_issue(ls, m, issue, { pr_pool = pr_pool })
-        end, '')
+          emit_issue(ls, m, issue, { pr_pool = pr_pool, section_status = status })
+        end, '', { pill_hl = jira_status_pill(status) })
       end
     end
     local other = {}
@@ -830,6 +1087,7 @@ local function render()
       end
     end
     if #other > 0 then
+      sort_by_has_pr(other)
       emit_section(lines, meta, 'Other', other, function(ls, m, issue)
         emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
       end, '')
@@ -839,6 +1097,30 @@ local function render()
   emit_footer(lines)
 
   state.line_meta = meta
+
+  local total = #lines
+  for i, section_start in ipairs(pending_sections) do
+    local section_end = pending_sections[i + 1] and (pending_sections[i + 1] - 1) or (total - 1)
+    local subs_in_section = {}
+    for _, sub_idx in ipairs(pending_subsections) do
+      if sub_idx > section_start and sub_idx <= section_end then
+        table.insert(subs_in_section, sub_idx)
+      end
+    end
+    if #subs_in_section == 0 then
+      for ln = section_start + 1, section_end do
+        table.insert(pending_line_bgs, { line = ln, hl = 'DashboardCardBg' })
+      end
+    else
+      for si, sub_start in ipairs(subs_in_section) do
+        local sub_actual_start = (si == 1) and (section_start + 1) or sub_start
+        local sub_end = subs_in_section[si + 1] and (subs_in_section[si + 1] - 1) or section_end
+        for ln = sub_actual_start, sub_end do
+          table.insert(pending_line_bgs, { line = ln, hl = 'DashboardCardBg' })
+        end
+      end
+    end
+  end
 
   vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, lines)
   flush_hls()
@@ -944,7 +1226,44 @@ local function tmux_run(args, cwd)
   vim.system(cmd)
 end
 
+local function resolve_repo_path(repo)
+  local raw = config.repo_paths[repo]
+  if not raw then
+    return nil
+  end
+  return vim.fn.expand(raw)
+end
+
 function M.checkout_under_cursor()
+  local m = under_cursor()
+  if not m or not m.pr then
+    return
+  end
+  local repo_path = resolve_repo_path(m.pr.repo)
+  if not repo_path then
+    vim.notify('No local path configured for ' .. m.pr.repo, vim.log.levels.WARN)
+    return
+  end
+  vim.notify(string.format('Checking out %s#%d…', m.pr.repo, m.pr.number), vim.log.levels.INFO)
+  vim.system({ 'gh', 'pr', 'checkout', tostring(m.pr.number) }, { cwd = repo_path, text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        vim.notify('Checkout failed: ' .. (obj.stderr or 'unknown'), vim.log.levels.ERROR)
+        return
+      end
+      M.close()
+      vim.cmd('tcd ' .. vim.fn.fnameescape(repo_path))
+      local readme = repo_path .. '/README.md'
+      if vim.fn.filereadable(readme) == 1 then
+        vim.cmd('edit ' .. vim.fn.fnameescape(readme))
+      else
+        vim.cmd('edit ' .. vim.fn.fnameescape(repo_path))
+      end
+    end)
+  end)
+end
+
+function M.interactive_claude_under_cursor()
   local m = under_cursor()
   if not m or not m.pr then
     return
@@ -953,15 +1272,21 @@ function M.checkout_under_cursor()
     vim.notify('Not in a tmux session', vim.log.levels.WARN)
     return
   end
-  local repo_path = config.repo_paths[m.pr.repo]
+  local repo_path = resolve_repo_path(m.pr.repo)
   if not repo_path then
     vim.notify('No local path configured for ' .. m.pr.repo, vim.log.levels.WARN)
     return
   end
-  repo_path = vim.fn.expand(repo_path)
-  local shell = vim.env.SHELL or '/bin/sh'
-  local cmd_str = string.format('gh pr checkout %d; exec %s', m.pr.number, shell)
-  tmux_run({ cmd_str }, repo_path)
+  vim.notify(string.format('Checking out %s#%d for Claude…', m.pr.repo, m.pr.number), vim.log.levels.INFO)
+  vim.system({ 'gh', 'pr', 'checkout', tostring(m.pr.number) }, { cwd = repo_path, text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        vim.notify('Checkout failed: ' .. (obj.stderr or 'unknown'), vim.log.levels.ERROR)
+        return
+      end
+      tmux_run({ 'claude' }, repo_path)
+    end)
+  end)
 end
 
 local function parse_diff(diff_text)
@@ -1021,6 +1346,96 @@ local function open_diff_window(title, body)
   vim.bo[right_buf].modifiable = false
   vim.bo[right_buf].bufhidden = 'wipe'
 
+  -- Pass 1: classify each line, compute old/new line numbers, find max widths
+  local row_info = {}
+  local old_l, new_l = 0, 0
+  local max_old, max_new = 1, 1
+  for i, line in ipairs(body_lines) do
+    local info = {}
+    if line:match '^diff %-%-git ' then
+      old_l, new_l = 0, 0
+      info.is_file_header = true
+    elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' then
+      -- file metadata header: no gutter, no bg
+    elseif line:match '^@@' then
+      local o, n = line:match '^@@ %-(%d+)%S* %+(%d+)'
+      old_l = (tonumber(o) or 1) - 1
+      new_l = (tonumber(n) or 1) - 1
+      info.bg = 'DiffChange'
+    elseif line:sub(1, 1) == '+' then
+      new_l = new_l + 1
+      info.new = new_l
+      info.bg = 'DiffAdd'
+    elseif line:sub(1, 1) == '-' then
+      old_l = old_l + 1
+      info.old = old_l
+      info.bg = 'DiffDelete'
+    else
+      -- context
+      old_l = old_l + 1
+      new_l = new_l + 1
+      info.old = old_l
+      info.new = new_l
+    end
+    if info.old and #tostring(info.old) > max_old then
+      max_old = #tostring(info.old)
+    end
+    if info.new and #tostring(info.new) > max_new then
+      max_new = #tostring(info.new)
+    end
+    row_info[i] = info
+  end
+
+  local empty_old = string.rep(' ', max_old)
+  local empty_new = string.rep(' ', max_new)
+  local fmt_old = '%' .. max_old .. 'd'
+  local fmt_new = '%' .. max_new .. 'd'
+
+  -- Pass 2: apply extmarks (separator above each file, gutter, background)
+  for i, line in ipairs(body_lines) do
+    local info = row_info[i]
+    if info.is_file_header then
+      local fname = line:match 'b/(.+)$' or '?'
+      local label = ' ' .. fname .. ' '
+      if #label > right_content_w - 10 then
+        local visible = math.max(3, right_content_w - 14)
+        label = ' …' .. fname:sub(#fname - visible + 1) .. ' '
+      end
+      local pad_total = right_content_w - #label
+      if pad_total < 2 then
+        pad_total = 2
+      end
+      local pad_left = math.floor(pad_total / 2)
+      local pad_right = pad_total - pad_left
+      vim.api.nvim_buf_set_extmark(right_buf, ns, i - 1, 0, {
+        virt_lines = {
+          { { '', '' } },
+          {
+            { string.rep('━', pad_left), 'NonText' },
+            { label, 'Title' },
+            { string.rep('━', pad_right), 'NonText' },
+          },
+          { { '', '' } },
+        },
+        virt_lines_above = true,
+      })
+    end
+    if info.old or info.new then
+      local old_s = info.old and string.format(fmt_old, info.old) or empty_old
+      local new_s = info.new and string.format(fmt_new, info.new) or empty_new
+      local gutter = ' ' .. old_s .. ' ' .. new_s .. ' │ '
+      vim.api.nvim_buf_set_extmark(right_buf, ns, i - 1, 0, {
+        virt_text = { { gutter, 'LineNr' } },
+        virt_text_pos = 'inline',
+      })
+    end
+    if info.bg then
+      vim.api.nvim_buf_set_extmark(right_buf, ns, i - 1, 0, {
+        line_hl_group = info.bg,
+      })
+    end
+  end
+
   local right_win = vim.api.nvim_open_win(right_buf, false, {
     relative = 'editor',
     width = right_content_w,
@@ -1035,7 +1450,10 @@ local function open_diff_window(title, body)
   })
   vim.wo[right_win].cursorline = true
   vim.wo[right_win].wrap = false
-  vim.wo[right_win].number = true
+  vim.wo[right_win].number = false
+  vim.wo[right_win].signcolumn = 'no'
+  vim.wo[right_win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
 
   -- Left (file list) buffer + window
   local left_buf = vim.api.nvim_create_buf(false, true)
@@ -1061,17 +1479,21 @@ local function open_diff_window(title, body)
   local list_lines = {}
   local hl_ranges = {}
   for _, f in ipairs(files) do
-    local path = f.path
     local add_str = '+' .. f.add
     local del_str = '-' .. f.del
-    local stats = '  ' .. add_str .. ' ' .. del_str
-    local max_path = left_content_w - #stats - 1
-    if #path > max_path and max_path > 1 then
-      path = '…' .. path:sub(#path - max_path + 2)
+    local stats = add_str .. ' ' .. del_str
+    local path = f.path
+    local path_max = left_content_w - #stats - 1
+    if #path > path_max and path_max > 1 then
+      path = '…' .. path:sub(#path - path_max + 2)
     end
-    local line = path .. stats
+    local gap = left_content_w - #path - #stats
+    if gap < 1 then
+      gap = 1
+    end
+    local line = path .. string.rep(' ', gap) .. stats
     table.insert(list_lines, line)
-    local add_start = #path + 2
+    local add_start = #path + gap
     local add_end = add_start + #add_str
     local del_start = add_end + 1
     local del_end = del_start + #del_str
@@ -1109,10 +1531,9 @@ local function open_diff_window(title, body)
     if not f or not vim.api.nvim_win_is_valid(right_win) then
       return
     end
-    vim.api.nvim_win_call(right_win, function()
-      vim.api.nvim_win_set_cursor(right_win, { f.start_line, 0 })
-      vim.cmd 'normal! zt'
-    end)
+    vim.api.nvim_set_current_win(right_win)
+    vim.api.nvim_win_set_cursor(right_win, { f.start_line, 0 })
+    vim.cmd 'normal! zt'
   end
 
   local left_opts = { buffer = left_buf, nowait = true, silent = true }
@@ -1204,6 +1625,275 @@ local function format_review_threads(threads, ctx_id)
   return table.concat(lines, '\n')
 end
 
+local function render_jira_issue(buf, win, issue)
+  vim.bo[buf].filetype = ''
+  local content_w = vim.api.nvim_win_get_width(win) - 2
+  local dash_w = math.max(10, content_w - 4)
+
+  local lines = {}
+  local line_bgs = {}
+  local range_hls = {}
+
+  local function push_raw(text)
+    table.insert(lines, text)
+    return #lines - 1
+  end
+  local function push_bg(text, bg)
+    local idx = push_raw(text)
+    if bg then
+      table.insert(line_bgs, { line = idx, hl = bg })
+    end
+    return idx
+  end
+  local function push_seg(segs, bg)
+    local text = ''
+    local local_hls = {}
+    for _, s in ipairs(segs) do
+      local col_start = #text
+      text = text .. s.text
+      if s.hl then
+        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+      end
+    end
+    local idx = push_raw(text)
+    for _, h in ipairs(local_hls) do
+      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    end
+    if bg then
+      table.insert(line_bgs, { line = idx, hl = bg })
+    end
+    return idx
+  end
+
+  -- HEADER CARD
+  local hbg = 'DashboardCardBgAlt'
+  push_bg('', hbg)
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = '▎  ', hl = 'DashboardAccentJira' },
+    { text = issue.key, hl = '@number' },
+  }, hbg)
+  push_seg({
+    { text = '     ', hl = nil },
+    { text = issue.title or '', hl = 'Title' },
+  }, hbg)
+  push_bg('', hbg)
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = 'Status:', hl = 'Comment' },
+    { text = ' ' .. (issue.status or '?'), hl = 'Normal' },
+    { text = '  ·  ', hl = 'NonText' },
+    { text = 'Priority:', hl = 'Comment' },
+    { text = ' ' .. (issue.priority or '?'), hl = 'Normal' },
+    { text = '  ·  ', hl = 'NonText' },
+    { text = 'Type:', hl = 'Comment' },
+    { text = ' ' .. (issue.type or '?'), hl = 'Normal' },
+  }, hbg)
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = 'Reporter:', hl = 'Comment' },
+    { text = ' ' .. (issue.reporter or '?'), hl = 'Normal' },
+    { text = '  ·  ', hl = 'NonText' },
+    { text = 'Assignee:', hl = 'Comment' },
+    { text = ' ' .. (issue.assignee or '?'), hl = 'Normal' },
+  }, hbg)
+  if issue.labels and #issue.labels > 0 then
+    push_seg({
+      { text = '  ', hl = nil },
+      { text = 'Labels:', hl = 'Comment' },
+      { text = ' ' .. table.concat(issue.labels, ', '), hl = '@string' },
+    }, hbg)
+  end
+  push_bg('', hbg)
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = 'DESCRIPTION', hl = 'Title' },
+  }, hbg)
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = string.rep('╌', dash_w), hl = 'NonText' },
+  }, hbg)
+  local desc = issue.description or ''
+  if desc:gsub('%s', '') == '' then
+    push_seg({
+      { text = '  ', hl = nil },
+      { text = '(no description)', hl = 'Comment' },
+    }, hbg)
+  else
+    for _, l in ipairs(vim.split(desc, '\n', { plain = true })) do
+      push_bg('  ' .. l, hbg)
+    end
+  end
+  push_bg('', hbg)
+
+  push_raw('')
+  push_raw('')
+
+  -- COMMENTS heading
+  local total = issue.comment_total or #issue.comments
+  push_seg({
+    { text = '  ', hl = nil },
+    { text = 'COMMENTS', hl = 'Title' },
+    { text = '  ' .. tostring(total), hl = 'Comment' },
+  })
+  if total > #issue.comments then
+    push_raw('')
+    push_seg({
+      { text = '  ', hl = nil },
+      { text = 'Showing ' .. #issue.comments .. ' of ' .. total, hl = 'Comment' },
+    })
+  end
+  push_raw('')
+
+  if #issue.comments == 0 then
+    push_seg({
+      { text = '  ', hl = nil },
+      { text = '(no comments yet)', hl = 'Comment' },
+    })
+  else
+    local function emit_top(c)
+      local indent = '  '
+      local author = c.author or '?'
+      local age = c.created and ago(c.created) or ''
+      local prefix_w = vim.fn.strdisplaywidth(indent .. '  ' .. author)
+      local age_w = vim.fn.strdisplaywidth(age)
+      local pad_w = content_w - prefix_w - age_w - 4
+      if pad_w < 2 then
+        pad_w = 2
+      end
+      local border_w = math.max(10, content_w - 6)
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '╭' .. string.rep('─', border_w) .. '╮', hl = 'DashboardAccentJira' },
+      }
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '  ', hl = nil },
+        { text = author, hl = 'Title' },
+        { text = string.rep(' ', pad_w), hl = nil },
+        { text = age, hl = 'Comment' },
+      }
+      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+        push_raw(indent .. '  ' .. l)
+      end
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '╰' .. string.rep('─', border_w) .. '╯', hl = 'DashboardAccentJira' },
+      }
+    end
+
+    local function emit_reply(c)
+      local bar_prefix = '  │  '
+      local bar_w = vim.fn.strdisplaywidth(bar_prefix)
+      local author = c.author or '?'
+      local age = c.created and ago(c.created) or ''
+      local prefix_w = bar_w + 2 + vim.fn.strdisplaywidth(author)
+      local age_w = vim.fn.strdisplaywidth(age)
+      local pad_w = content_w - prefix_w - age_w - 4
+      if pad_w < 2 then
+        pad_w = 2
+      end
+      local border_w = math.max(10, content_w - bar_w - 4)
+
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│', hl = 'DashboardAccentJira' },
+      }
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentJira' },
+        { text = '╭' .. string.rep('─', border_w) .. '╮', hl = 'DashboardAccentJira' },
+      }
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentJira' },
+        { text = '  ', hl = nil },
+        { text = author, hl = 'Title' },
+        { text = string.rep(' ', pad_w), hl = nil },
+        { text = age, hl = 'Comment' },
+      }
+      for _, l in ipairs(vim.split(c.body or '', '\n', { plain = true })) do
+        push_seg {
+          { text = '  ', hl = nil },
+          { text = '│  ', hl = 'DashboardAccentJira' },
+          { text = '  ' .. l, hl = 'Normal' },
+        }
+      end
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '│  ', hl = 'DashboardAccentJira' },
+        { text = '╰' .. string.rep('─', border_w) .. '╯', hl = 'DashboardAccentJira' },
+      }
+    end
+
+    local top_level = {}
+    local replies_by_parent = {}
+    for _, c in ipairs(issue.comments) do
+      if c.parent_id then
+        replies_by_parent[c.parent_id] = replies_by_parent[c.parent_id] or {}
+        table.insert(replies_by_parent[c.parent_id], c)
+      else
+        table.insert(top_level, c)
+      end
+    end
+    table.sort(top_level, function(a, b)
+      return (a.created or '') > (b.created or '')
+    end)
+    for _, replies in pairs(replies_by_parent) do
+      table.sort(replies, function(a, b)
+        return (a.created or '') < (b.created or '')
+      end)
+    end
+
+    for ti, tc in ipairs(top_level) do
+      emit_top(tc)
+      for _, rc in ipairs(replies_by_parent[tc.id] or {}) do
+        emit_reply(rc)
+      end
+      if ti < #top_level then
+        push_raw('')
+      end
+    end
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  for _, h in ipairs(range_hls) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  for _, bg in ipairs(line_bgs) do
+    vim.api.nvim_buf_set_extmark(buf, ns, bg.line, 0, {
+      end_line = bg.line + 1,
+      end_col = 0,
+      hl_group = bg.hl,
+      hl_eol = true,
+      priority = 10,
+    })
+  end
+  vim.bo[buf].modifiable = false
+end
+
+function M.comments_under_cursor()
+  local m = under_cursor()
+  if not m or m.kind ~= 'jira' or not m.key then
+    return
+  end
+  local handle = open_result_window(m.key, nil, 'Loading ticket…')
+  require('dashboard.jira').fetch_issue(m.key, function(issue, err)
+    if not issue then
+      handle.set_error(err or 'failed to fetch')
+      return
+    end
+    handle.set_content(function(buf, win)
+      render_jira_issue(buf, win, issue)
+    end)
+  end)
+end
+
 function M.threads_under_cursor()
   local m = under_cursor()
   if not m or m.kind ~= 'pr' or not m.pr or not m.pr.repo or not m.pr.number then
@@ -1266,6 +1956,8 @@ function open_result_window(title, on_reprompt, loading_text)
   vim.wo[win].cursorline = false
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  vim.wo[win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
 
   local frames = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
   local frame_i = 1
@@ -1316,12 +2008,19 @@ function open_result_window(title, on_reprompt, loading_text)
   vim.keymap.set('n', 'q', close, opts)
   vim.keymap.set('n', '<Esc>', close, opts)
 
-  local function set_content(text)
+  local function set_content(text_or_renderer)
     stop_spinner()
     if not vim.api.nvim_buf_is_valid(buf) then
       return
     end
-    set_lines(vim.split(text, '\n', { plain = true }))
+    if type(text_or_renderer) == 'function' then
+      vim.bo[buf].modifiable = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+      vim.bo[buf].modifiable = false
+      text_or_renderer(buf, win)
+    else
+      set_lines(vim.split(text_or_renderer, '\n', { plain = true }))
+    end
     if on_reprompt then
       local _, order = require('dashboard.claude').prompts()
       for i, key in ipairs(order) do
@@ -1438,6 +2137,7 @@ function M.yank_under_cursor()
 end
 
 function M.close()
+  stop_spinner()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_win_close(state.win, true)
   end
@@ -1455,6 +2155,91 @@ function M.focus_last_result()
   end
 end
 
+local HELP_TEXT = [[# Status Dashboard — Keymaps
+
+## Global
+  <CR>    open url in browser
+  y       yank url
+  f       filter every section by substring
+  r       refresh now
+  q       close dashboard
+  g?      this help
+  <leader>od   open / refocus dashboard
+  <leader>or   focus last result window
+
+## Notes section
+  n       new note (auto-prepends "- ")
+  T       new todo (auto-prepends "- [ ] ")
+  x       toggle todo checkbox on the cursor row
+  <CR>    open today's notes file for editing
+
+## GitHub PR rows
+  c       checkout PR, open repo in nvim
+  i       checkout + claude interactive in tmux pane
+  D       two-pane diff viewer (file list + diff)
+  t       review threads pane
+  s       claude summary
+  ?       claude prompt picker (summary / understand / risks / next / code review)
+
+## Jira rows
+  C       read ticket description + comments in a panel
+
+## Notifications
+  x       mark notification as read
+
+## Diff viewer
+  <CR>    jump diff to selected file's hunk + focus diff pane
+  <Tab>   toggle focus (files ↔ diff)
+  q       close both panes
+
+## Claude / threads window
+  1-5     re-prompt against cached context
+  q       close
+
+## Badge legend
+  CI:        ✓ pass   ✗ fail   ● pending   · n/a
+  Review:    ✓ 2+ approvals   ◐ 1 approval   ○ none yet   ✗ changes requested   · no review required
+]]
+
+function M.show_help()
+  local buf = vim.api.nvim_create_buf(false, true)
+  local lines = vim.split(HELP_TEXT, '\n', { plain = true })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].filetype = 'markdown'
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+
+  local width = math.min(82, math.floor(vim.o.columns * 0.6))
+  local height = math.min(40, math.floor(vim.o.lines * 0.85))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local available = vim.o.lines - vim.o.cmdheight - statusline
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = math.floor((available - height) / 2),
+    col = math.floor((vim.o.columns - width) / 2),
+    style = 'minimal',
+    border = 'rounded',
+    title = ' Keymaps ',
+    title_pos = 'center',
+    zindex = 60,
+  })
+  vim.wo[win].cursorline = false
+  vim.wo[win].wrap = false
+
+  local close = function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+  local opts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', 'q', close, opts)
+  vim.keymap.set('n', '<Esc>', close, opts)
+  vim.keymap.set('n', 'g?', close, opts)
+end
+
 function M.filter_prompt()
   vim.ui.input({ prompt = 'Filter: ', default = state.filter or '' }, function(input)
     if input == nil then
@@ -1467,6 +2252,40 @@ function M.filter_prompt()
   end)
 end
 
+local function any_loading()
+  return state.data.my_prs == nil
+    or state.data.reviews == nil
+    or state.data.notifications == nil
+    or state.data.jira_active == nil
+end
+
+function stop_spinner()
+  if spinner_state.timer then
+    spinner_state.timer:stop()
+    spinner_state.timer:close()
+    spinner_state.timer = nil
+  end
+end
+
+local function start_spinner()
+  if spinner_state.timer then
+    return
+  end
+  spinner_state.timer = vim.uv.new_timer()
+  spinner_state.timer:start(
+    80,
+    80,
+    vim.schedule_wrap(function()
+      if not buf_valid() or not any_loading() then
+        stop_spinner()
+        return
+      end
+      spinner_state.frame_i = (spinner_state.frame_i % #SPINNER_FRAMES) + 1
+      render()
+    end)
+  )
+end
+
 function M.refresh()
   state.data = {
     my_prs = nil,
@@ -1474,6 +2293,7 @@ function M.refresh()
     notifications = nil,
     jira_active = nil,
   }
+  start_spinner()
   render()
 
   local function update(key)
@@ -1529,9 +2349,10 @@ function M.open()
     title_pos = 'center',
   })
 
-  vim.wo[state.win].cursorline = true
+  vim.wo[state.win].cursorline = false
   vim.wo[state.win].wrap = false
-  vim.wo[state.win].winhighlight = 'Normal:NormalFloat,FloatBorder:FloatBorder,CursorLine:PmenuSel'
+  vim.wo[state.win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
   vim.wo[state.win].sidescrolloff = 4
 
   local opts = { buffer = state.buf, nowait = true, silent = true }
@@ -1541,8 +2362,10 @@ function M.open()
   vim.keymap.set('n', '<CR>', M.open_under_cursor, opts)
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
+  vim.keymap.set('n', 'i', M.interactive_claude_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 't', M.threads_under_cursor, opts)
+  vim.keymap.set('n', 'C', M.comments_under_cursor, opts)
   vim.keymap.set('n', 'x', function()
     local m = under_cursor()
     if not m then
@@ -1560,6 +2383,7 @@ function M.open()
   end, opts)
   vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
   vim.keymap.set('n', 'f', M.filter_prompt, opts)
+  vim.keymap.set('n', 'g?', M.show_help, opts)
   vim.keymap.set('n', 'n', M.add_note, opts)
 
   vim.api.nvim_create_autocmd('FocusGained', {
@@ -1571,7 +2395,38 @@ function M.open()
     end,
   })
 
+  local function update_cursor_hl()
+    if not buf_valid() then
+      return
+    end
+    vim.api.nvim_buf_clear_namespace(state.buf, cursor_ns, 0, -1)
+    if state.win and vim.api.nvim_win_is_valid(state.win) and vim.api.nvim_get_current_win() == state.win then
+      local row = vim.api.nvim_win_get_cursor(state.win)[1] - 1
+      vim.api.nvim_buf_set_extmark(state.buf, cursor_ns, row, 0, {
+        end_line = row + 1,
+        end_col = 0,
+        hl_group = 'DashboardCursorLine',
+        hl_eol = true,
+        priority = 1000,
+      })
+    end
+  end
+
+  vim.api.nvim_create_autocmd({ 'CursorMoved', 'WinEnter', 'BufEnter' }, {
+    buffer = state.buf,
+    callback = update_cursor_hl,
+  })
+  vim.api.nvim_create_autocmd({ 'WinLeave', 'BufLeave' }, {
+    buffer = state.buf,
+    callback = function()
+      if buf_valid() then
+        vim.api.nvim_buf_clear_namespace(state.buf, cursor_ns, 0, -1)
+      end
+    end,
+  })
+
   M.refresh()
+  update_cursor_hl()
 end
 
 return M

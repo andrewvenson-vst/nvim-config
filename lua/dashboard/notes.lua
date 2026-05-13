@@ -26,6 +26,31 @@ function M.read_today()
   return vim.fn.readfile(path)
 end
 
+function M.read_file(path)
+  if not path or vim.fn.filereadable(path) ~= 1 then
+    return {}
+  end
+  return vim.fn.readfile(path)
+end
+
+function M.find_previous(today_date)
+  local dir = vim.fn.expand(config.notes_dir)
+  if vim.fn.isdirectory(dir) ~= 1 then
+    return nil, nil
+  end
+  local files = vim.fn.glob(dir .. '/*.txt', false, true)
+  local best, best_date = nil, nil
+  for _, f in ipairs(files) do
+    local name = vim.fn.fnamemodify(f, ':t:r')
+    if name:match '^%d%d%d%d%-%d%d%-%d%d$' and name < today_date then
+      if not best_date or name > best_date then
+        best, best_date = f, name
+      end
+    end
+  end
+  return best, best_date
+end
+
 function M.append(line)
   local path = M.path_for_today()
   local dir = vim.fn.fnamemodify(path, ':h')
