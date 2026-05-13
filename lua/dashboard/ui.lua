@@ -1350,197 +1350,308 @@ local function focus_diff_viewer()
   return false
 end
 
+-- Highlight code inside a diff body using treesitter, per-file with the file's
+-- language. The diff body is structured as alternating file headers and hunks;
+-- for each file we strip the +/-/space prefix from code lines, parse the
+-- result with treesitter, and apply each capture as an extmark in the actual
+-- buffer (column offset by 1 to skip the prefix).
+local function apply_diff_language_highlights(buf, body_lines, header_len)
+  if not (vim.treesitter and vim.treesitter.get_string_parser) then
+    return
+  end
+
+  local blocks = {}
+  local current
+  for i, line in ipairs(body_lines) do
+    if line:match '^diff %-%-git ' then
+      if current and #current.lines > 0 then
+        table.insert(blocks, current)
+      end
+      local path = line:match 'b/(.+)$' or ''
+      local ok, ft = pcall(vim.filetype.match, { filename = path })
+      local lang = ok and ft or nil
+      if lang then
+        -- Map filetype to treesitter language (often same, sometimes not).
+        local ok2, ts_lang = pcall(vim.treesitter.language.get_lang, lang)
+        if ok2 and ts_lang then
+          lang = ts_lang
+        end
+      end
+      current = lang and { lang = lang, lines = {} } or nil
+    elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' or line:match '^@@' then
+      -- diff metadata: skip
+    elseif current then
+      table.insert(current.lines, { buf_row = i - 1 + header_len, content = line:sub(2) })
+    end
+  end
+  if current and #current.lines > 0 then
+    table.insert(blocks, current)
+  end
+
+  for _, block in ipairs(blocks) do
+    local src_lines = {}
+    for _, item in ipairs(block.lines) do
+      table.insert(src_lines, item.content)
+    end
+    local source = table.concat(src_lines, '\n')
+    if source == '' then
+      goto continue
+    end
+
+    local ok_lang = pcall(vim.treesitter.language.add, block.lang)
+    if not ok_lang then
+      goto continue
+    end
+    local ok_parser, parser = pcall(vim.treesitter.get_string_parser, source, block.lang)
+    if not ok_parser or not parser then
+      goto continue
+    end
+    local tree = parser:parse() and parser:parse()[1]
+    if not tree then
+      goto continue
+    end
+    local ok_q, query = pcall(vim.treesitter.query.get, block.lang, 'highlights')
+    if not ok_q or not query then
+      goto continue
+    end
+
+    for id, node in query:iter_captures(tree:root(), source, 0, -1) do
+      local capture_name = query.captures[id]
+      local hl_group = '@' .. capture_name .. '.' .. block.lang
+      local srow, scol, erow, ecol = node:range()
+      local s_item = block.lines[srow + 1]
+      local e_item = block.lines[erow + 1] or s_item
+      if s_item then
+        pcall(vim.api.nvim_buf_set_extmark, buf, ns, s_item.buf_row, scol + 1, {
+          end_row = e_item and e_item.buf_row or s_item.buf_row,
+          end_col = ecol + 1,
+          hl_group = hl_group,
+          priority = 200,
+        })
+      end
+    end
+    ::continue::
+  end
+end
+
 local function open_diff_window(title, body, overview)
   local files = parse_diff(body)
-
-  -- Layout: two abutting floating windows.
-  -- total visual width = left_content + right_content + 4 (four borders).
-  local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
-  local left_content_w = 35
-  local right_content_w = total_w - left_content_w - 4
-  if right_content_w < 40 then
-    -- Narrow terminals: shrink left pane.
-    left_content_w = math.max(20, total_w - 44)
-    right_content_w = total_w - left_content_w - 4
-  end
-  local height = math.min(50, math.floor(vim.o.lines * 0.9))
-  local statusline = vim.o.laststatus > 0 and 1 or 0
-  local available = vim.o.lines - vim.o.cmdheight - statusline
-  local row = math.floor((available - height) / 2)
-  local total_col_start = math.floor((vim.o.columns - total_w) / 2)
-  local left_col = total_col_start + 1
-  local right_col = left_col + left_content_w + 2
-
-  -- Build PR header lines
-  local header_lines = {}
-  local header_bgs = {}
-  local header_hls = {}
-  local function h_push_raw(text)
-    table.insert(header_lines, text)
-    return #header_lines - 1
-  end
-  local function h_push_bg(text, bg)
-    local idx = h_push_raw(text)
-    if bg then
-      table.insert(header_bgs, { line = idx, hl = bg })
-    end
-    return idx
-  end
-  local function h_push_seg(segs)
-    local text = ''
-    local local_hls = {}
-    for _, s in ipairs(segs) do
-      local col_start = #text
-      text = text .. s.text
-      if s.hl then
-        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
-      end
-    end
-    local idx = h_push_raw(text)
-    for _, h in ipairs(local_hls) do
-      table.insert(header_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
-    end
-    return idx
-  end
-
-  emit_pr_header_card(right_content_w, overview, h_push_raw, h_push_bg, h_push_seg)
-  local header_len = #header_lines
-
-  -- Right (diff) buffer + window
-  local right_buf = vim.api.nvim_create_buf(false, true)
   local body_lines = vim.split(body or '', '\n', { plain = true })
-  local combined = {}
-  for _, l in ipairs(header_lines) do
-    table.insert(combined, l)
+
+  -- Width-independent: classify body lines, compute gutter widths.
+  local row_info = {}
+  do
+    local old_l, new_l = 0, 0
+    local max_old, max_new = 1, 1
+    for i, line in ipairs(body_lines) do
+      local info = {}
+      if line:match '^diff %-%-git ' then
+        old_l, new_l = 0, 0
+        info.is_file_header = true
+      elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' then
+        -- file metadata header: no gutter, no bg
+      elseif line:match '^@@' then
+        local o, n = line:match '^@@ %-(%d+)%S* %+(%d+)'
+        old_l = (tonumber(o) or 1) - 1
+        new_l = (tonumber(n) or 1) - 1
+        info.bg = 'DiffChange'
+      elseif line:sub(1, 1) == '+' then
+        new_l = new_l + 1
+        info.new = new_l
+        info.bg = 'DiffAdd'
+      elseif line:sub(1, 1) == '-' then
+        old_l = old_l + 1
+        info.old = old_l
+        info.bg = 'DiffDelete'
+      else
+        old_l = old_l + 1
+        new_l = new_l + 1
+        info.old = old_l
+        info.new = new_l
+      end
+      if info.old and #tostring(info.old) > max_old then
+        max_old = #tostring(info.old)
+      end
+      if info.new and #tostring(info.new) > max_new then
+        max_new = #tostring(info.new)
+      end
+      row_info[i] = info
+    end
+    row_info._max_old = max_old
+    row_info._max_new = max_new
   end
-  for _, l in ipairs(body_lines) do
-    table.insert(combined, l)
+
+  local function compute_geom()
+    local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+    local left_content_w = 35
+    local right_content_w = total_w - left_content_w - 4
+    if right_content_w < 40 then
+      left_content_w = math.max(20, total_w - 44)
+      right_content_w = total_w - left_content_w - 4
+    end
+    local height = math.min(50, math.floor(vim.o.lines * 0.9))
+    local statusline = vim.o.laststatus > 0 and 1 or 0
+    local available = vim.o.lines - vim.o.cmdheight - statusline
+    local row = math.floor((available - height) / 2)
+    local total_col_start = math.floor((vim.o.columns - total_w) / 2)
+    local left_col = total_col_start + 1
+    local right_col = left_col + left_content_w + 2
+    return {
+      total_w = total_w,
+      left_content_w = left_content_w,
+      right_content_w = right_content_w,
+      height = height,
+      row = row,
+      total_col_start = total_col_start,
+      left_col = left_col,
+      right_col = right_col,
+    }
   end
-  vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, combined)
+
+  local geom = compute_geom()
+
+  -- Right (diff) buffer
+  local right_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[right_buf].filetype = ''
   vim.bo[right_buf].buftype = 'nofile'
-  vim.bo[right_buf].modifiable = false
   vim.bo[right_buf].bufhidden = 'wipe'
 
-  -- Apply header extmarks
-  for _, h in ipairs(header_hls) do
-    vim.api.nvim_buf_set_extmark(right_buf, ns, h.line, h.col_start, {
-      end_col = h.col_end,
-      hl_group = h.hl,
-      priority = 100,
-    })
-  end
-  for _, bg in ipairs(header_bgs) do
-    vim.api.nvim_buf_set_extmark(right_buf, ns, bg.line, 0, {
-      end_line = bg.line + 1,
-      end_col = 0,
-      hl_group = bg.hl,
-      hl_eol = true,
-      priority = 10,
-    })
-  end
-
-  -- Pass 1: classify each line, compute old/new line numbers, find max widths
-  local row_info = {}
-  local old_l, new_l = 0, 0
-  local max_old, max_new = 1, 1
-  for i, line in ipairs(body_lines) do
-    local info = {}
-    if line:match '^diff %-%-git ' then
-      old_l, new_l = 0, 0
-      info.is_file_header = true
-    elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' then
-      -- file metadata header: no gutter, no bg
-    elseif line:match '^@@' then
-      local o, n = line:match '^@@ %-(%d+)%S* %+(%d+)'
-      old_l = (tonumber(o) or 1) - 1
-      new_l = (tonumber(n) or 1) - 1
-      info.bg = 'DiffChange'
-    elseif line:sub(1, 1) == '+' then
-      new_l = new_l + 1
-      info.new = new_l
-      info.bg = 'DiffAdd'
-    elseif line:sub(1, 1) == '-' then
-      old_l = old_l + 1
-      info.old = old_l
-      info.bg = 'DiffDelete'
-    else
-      -- context
-      old_l = old_l + 1
-      new_l = new_l + 1
-      info.old = old_l
-      info.new = new_l
+  -- Renders or re-renders the right buffer for the given width.
+  local function render_right(content_w)
+    local header_lines = {}
+    local header_bgs = {}
+    local header_hls = {}
+    local function h_push_raw(text)
+      table.insert(header_lines, text)
+      return #header_lines - 1
     end
-    if info.old and #tostring(info.old) > max_old then
-      max_old = #tostring(info.old)
-    end
-    if info.new and #tostring(info.new) > max_new then
-      max_new = #tostring(info.new)
-    end
-    row_info[i] = info
-  end
-
-  local empty_old = string.rep(' ', max_old)
-  local empty_new = string.rep(' ', max_new)
-  local fmt_old = '%' .. max_old .. 'd'
-  local fmt_new = '%' .. max_new .. 'd'
-
-  -- Pass 2: apply extmarks (separator above each file, gutter, background)
-  for i, line in ipairs(body_lines) do
-    local info = row_info[i]
-    local buf_line = i - 1 + header_len
-    if info.is_file_header then
-      local fname = line:match 'b/(.+)$' or '?'
-      local label = ' ' .. fname .. ' '
-      if #label > right_content_w - 10 then
-        local visible = math.max(3, right_content_w - 14)
-        label = ' …' .. fname:sub(#fname - visible + 1) .. ' '
+    local function h_push_bg(text, bg)
+      local idx = h_push_raw(text)
+      if bg then
+        table.insert(header_bgs, { line = idx, hl = bg })
       end
-      local pad_total = right_content_w - #label
-      if pad_total < 2 then
-        pad_total = 2
+      return idx
+    end
+    local function h_push_seg(segs)
+      local text = ''
+      local local_hls = {}
+      for _, s in ipairs(segs) do
+        local col_start = #text
+        text = text .. s.text
+        if s.hl then
+          table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+        end
       end
-      local pad_left = math.floor(pad_total / 2)
-      local pad_right = pad_total - pad_left
-      vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
-        virt_lines = {
-          { { '', '' } },
-          {
-            { string.rep('━', pad_left), 'NonText' },
-            { label, 'Title' },
-            { string.rep('━', pad_right), 'NonText' },
+      local idx = h_push_raw(text)
+      for _, h in ipairs(local_hls) do
+        table.insert(header_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+      end
+      return idx
+    end
+
+    emit_pr_header_card(content_w, overview, h_push_raw, h_push_bg, h_push_seg)
+    local header_len = #header_lines
+
+    local combined = {}
+    for _, l in ipairs(header_lines) do
+      table.insert(combined, l)
+    end
+    for _, l in ipairs(body_lines) do
+      table.insert(combined, l)
+    end
+
+    vim.bo[right_buf].modifiable = true
+    vim.api.nvim_buf_clear_namespace(right_buf, ns, 0, -1)
+    vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, combined)
+    vim.bo[right_buf].modifiable = false
+
+    for _, h in ipairs(header_hls) do
+      vim.api.nvim_buf_set_extmark(right_buf, ns, h.line, h.col_start, {
+        end_col = h.col_end,
+        hl_group = h.hl,
+        priority = 100,
+      })
+    end
+    for _, bg in ipairs(header_bgs) do
+      vim.api.nvim_buf_set_extmark(right_buf, ns, bg.line, 0, {
+        end_line = bg.line + 1,
+        end_col = 0,
+        hl_group = bg.hl,
+        hl_eol = true,
+        priority = 10,
+      })
+    end
+
+    local max_old = row_info._max_old
+    local max_new = row_info._max_new
+    local empty_old = string.rep(' ', max_old)
+    local empty_new = string.rep(' ', max_new)
+    local fmt_old = '%' .. max_old .. 'd'
+    local fmt_new = '%' .. max_new .. 'd'
+
+    for i, line in ipairs(body_lines) do
+      local info = row_info[i]
+      local buf_line = i - 1 + header_len
+      if info.is_file_header then
+        local fname = line:match 'b/(.+)$' or '?'
+        local label = ' ' .. fname .. ' '
+        if #label > content_w - 10 then
+          local visible = math.max(3, content_w - 14)
+          label = ' …' .. fname:sub(#fname - visible + 1) .. ' '
+        end
+        local pad_total = content_w - #label
+        if pad_total < 2 then
+          pad_total = 2
+        end
+        local pad_left = math.floor(pad_total / 2)
+        local pad_right = pad_total - pad_left
+        vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
+          virt_lines = {
+            { { '', '' } },
+            {
+              { string.rep('━', pad_left), 'NonText' },
+              { label, 'Title' },
+              { string.rep('━', pad_right), 'NonText' },
+            },
+            { { '', '' } },
           },
-          { { '', '' } },
-        },
-        virt_lines_above = true,
-      })
+          virt_lines_above = true,
+        })
+      end
+      if info.old or info.new then
+        local old_s = info.old and string.format(fmt_old, info.old) or empty_old
+        local new_s = info.new and string.format(fmt_new, info.new) or empty_new
+        local gutter = ' ' .. old_s .. ' ' .. new_s .. ' │ '
+        vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
+          virt_text = { { gutter, 'LineNr' } },
+          virt_text_pos = 'inline',
+        })
+      end
+      if info.bg then
+        vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
+          line_hl_group = info.bg,
+        })
+      end
     end
-    if info.old or info.new then
-      local old_s = info.old and string.format(fmt_old, info.old) or empty_old
-      local new_s = info.new and string.format(fmt_new, info.new) or empty_new
-      local gutter = ' ' .. old_s .. ' ' .. new_s .. ' │ '
-      vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
-        virt_text = { { gutter, 'LineNr' } },
-        virt_text_pos = 'inline',
-      })
+
+    -- Update files[*].start_line for jump_to_file (header_len changes per width)
+    for i, f in ipairs(files) do
+      f.start_line = f._raw_start + header_len
     end
-    if info.bg then
-      vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
-        line_hl_group = info.bg,
-      })
-    end
+
+    apply_diff_language_highlights(right_buf, body_lines, header_len)
   end
 
   for _, f in ipairs(files) do
-    f.start_line = f.start_line + header_len
+    f._raw_start = f.start_line
   end
 
   local right_win = vim.api.nvim_open_win(right_buf, false, {
     relative = 'editor',
-    width = right_content_w,
-    height = height,
-    row = row,
-    col = right_col,
+    width = geom.right_content_w,
+    height = geom.height,
+    row = geom.row,
+    col = geom.right_col,
     style = 'minimal',
     border = 'rounded',
     title = ' ' .. title .. ' ',
@@ -1554,67 +1665,98 @@ local function open_diff_window(title, body, overview)
   vim.wo[right_win].winhighlight =
     'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
 
+  render_right(geom.right_content_w)
+
   -- Left (file list) buffer + window
   local left_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[left_buf].buftype = 'nofile'
-  vim.bo[left_buf].bufhidden = 'wipe'
+  vim.bo[left_buf].bufhidden = 'hide'
 
-  local left_win = vim.api.nvim_open_win(left_buf, true, {
-    relative = 'editor',
-    width = left_content_w,
-    height = height,
-    row = row,
-    col = left_col,
-    style = 'minimal',
-    border = 'rounded',
-    title = string.format(' Files (%d) ', #files),
-    title_pos = 'center',
-    zindex = 60,
-  })
-  vim.wo[left_win].cursorline = true
-  vim.wo[left_win].wrap = false
-  vim.wo[left_win].winhighlight =
-    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
-
-  -- Render file list
-  local list_lines = {}
-  local hl_ranges = {}
-  for _, f in ipairs(files) do
-    local add_str = '+' .. f.add
-    local del_str = '-' .. f.del
-    local stats = add_str .. ' ' .. del_str
-    local path = f.path
-    local path_max = left_content_w - #stats - 1
-    if #path > path_max and path_max > 1 then
-      path = '…' .. path:sub(#path - path_max + 2)
-    end
-    local gap = left_content_w - #path - #stats
-    if gap < 1 then
-      gap = 1
-    end
-    local line = path .. string.rep(' ', gap) .. stats
-    table.insert(list_lines, line)
-    local add_start = #path + gap
-    local add_end = add_start + #add_str
-    local del_start = add_end + 1
-    local del_end = del_start + #del_str
-    table.insert(
-      hl_ranges,
-      { line = #list_lines - 1, ranges = { { add_start, add_end, 'DiagnosticOk' }, { del_start, del_end, 'DiagnosticError' } } }
-    )
+  local function left_win_config()
+    return {
+      relative = 'editor',
+      width = geom.left_content_w,
+      height = geom.height,
+      row = geom.row,
+      col = geom.left_col,
+      style = 'minimal',
+      border = 'rounded',
+      title = string.format(' Files (%d) ', #files),
+      title_pos = 'center',
+      zindex = 60,
+    }
   end
-  if #list_lines == 0 then
-    list_lines = { '(no files in diff)' }
+  local function right_win_config_split()
+    return {
+      relative = 'editor',
+      width = geom.right_content_w,
+      height = geom.height,
+      row = geom.row,
+      col = geom.right_col,
+    }
+  end
+  local function right_win_config_full()
+    return {
+      relative = 'editor',
+      width = geom.total_w - 2,
+      height = geom.height,
+      row = geom.row,
+      col = geom.total_col_start + 1,
+    }
   end
 
-  vim.bo[left_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
-  for _, h in ipairs(hl_ranges) do
-    for _, r in ipairs(h.ranges) do
-      vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, r[1], { end_col = r[2], hl_group = r[3] })
-    end
+  local left_win = vim.api.nvim_open_win(left_buf, true, left_win_config())
+  local function apply_left_winopts()
+    vim.wo[left_win].cursorline = true
+    vim.wo[left_win].wrap = false
+    vim.wo[left_win].winhighlight =
+      'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
   end
-  vim.bo[left_buf].modifiable = false
+  apply_left_winopts()
+
+  local function render_left(content_w)
+    local list_lines = {}
+    local hl_ranges = {}
+    for _, f in ipairs(files) do
+      local add_str = '+' .. f.add
+      local del_str = '-' .. f.del
+      local stats = add_str .. ' ' .. del_str
+      local path = f.path
+      local path_max = content_w - #stats - 1
+      if #path > path_max and path_max > 1 then
+        path = '…' .. path:sub(#path - path_max + 2)
+      end
+      local gap = content_w - #path - #stats
+      if gap < 1 then
+        gap = 1
+      end
+      local line = path .. string.rep(' ', gap) .. stats
+      table.insert(list_lines, line)
+      local add_start = #path + gap
+      local add_end = add_start + #add_str
+      local del_start = add_end + 1
+      local del_end = del_start + #del_str
+      table.insert(
+        hl_ranges,
+        { line = #list_lines - 1, ranges = { { add_start, add_end, 'DiagnosticOk' }, { del_start, del_end, 'DiagnosticError' } } }
+      )
+    end
+    if #list_lines == 0 then
+      list_lines = { '(no files in diff)' }
+    end
+
+    vim.bo[left_buf].modifiable = true
+    vim.api.nvim_buf_clear_namespace(left_buf, ns, 0, -1)
+    vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
+    for _, h in ipairs(hl_ranges) do
+      for _, r in ipairs(h.ranges) do
+        vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, r[1], { end_col = r[2], hl_group = r[3] })
+      end
+    end
+    vim.bo[left_buf].modifiable = false
+  end
+
+  render_left(geom.left_content_w)
 
   state.last_result_win = right_win
   state.diff_left_win = left_win
@@ -1626,10 +1768,14 @@ local function open_diff_window(title, body, overview)
       return
     end
     closing = true
-    for _, w in ipairs { left_win, right_win } do
-      if vim.api.nvim_win_is_valid(w) then
-        pcall(vim.api.nvim_win_close, w, true)
-      end
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      pcall(vim.api.nvim_win_close, left_win, true)
+    end
+    if right_win and vim.api.nvim_win_is_valid(right_win) then
+      pcall(vim.api.nvim_win_close, right_win, true)
+    end
+    if left_buf and vim.api.nvim_buf_is_valid(left_buf) then
+      pcall(vim.api.nvim_buf_delete, left_buf, { force = true })
     end
     if state.diff_left_win == left_win then
       state.diff_left_win = nil
@@ -1641,13 +1787,68 @@ local function open_diff_window(title, body, overview)
   end
 
   vim.api.nvim_create_autocmd('WinClosed', {
-    pattern = { tostring(left_win), tostring(right_win) },
+    pattern = tostring(right_win),
     callback = function()
       vim.schedule(close)
     end,
   })
 
+  local function toggle_files()
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      if vim.api.nvim_get_current_win() == left_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_set_current_win(right_win)
+      end
+      pcall(vim.api.nvim_win_close, left_win, true)
+      left_win = nil
+      state.diff_left_win = nil
+      if right_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_win_set_config(right_win, right_win_config_full())
+        render_right(geom.total_w - 2)
+      end
+    else
+      if right_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_win_set_config(right_win, right_win_config_split())
+        render_right(geom.right_content_w)
+      end
+      if not (left_buf and vim.api.nvim_buf_is_valid(left_buf)) then
+        return
+      end
+      left_win = vim.api.nvim_open_win(left_buf, false, left_win_config())
+      apply_left_winopts()
+      state.diff_left_win = left_win
+    end
+  end
+
+  local function on_resize()
+    geom = compute_geom()
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      pcall(vim.api.nvim_win_set_config, left_win, left_win_config())
+      pcall(vim.api.nvim_win_set_config, right_win, right_win_config_split())
+      render_right(geom.right_content_w)
+      render_left(geom.left_content_w)
+    else
+      pcall(vim.api.nvim_win_set_config, right_win, right_win_config_full())
+      render_right(geom.total_w - 2)
+    end
+  end
+
+  vim.api.nvim_create_autocmd('VimResized', {
+    buffer = right_buf,
+    callback = function()
+      vim.schedule(on_resize)
+    end,
+  })
+  vim.api.nvim_create_autocmd('VimResized', {
+    buffer = left_buf,
+    callback = function()
+      vim.schedule(on_resize)
+    end,
+  })
+
   local function jump_to_file()
+    if not left_win or not vim.api.nvim_win_is_valid(left_win) then
+      return
+    end
     local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
     local f = files[lnum]
     if not f or not vim.api.nvim_win_is_valid(right_win) then
@@ -1662,6 +1863,7 @@ local function open_diff_window(title, body, overview)
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
   vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
+  vim.keymap.set('n', '\\', toggle_files, left_opts)
   vim.keymap.set('n', '<Tab>', function()
     if vim.api.nvim_win_is_valid(right_win) then
       vim.api.nvim_set_current_win(right_win)
@@ -1671,8 +1873,14 @@ local function open_diff_window(title, body, overview)
   local right_opts = { buffer = right_buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
+  vim.keymap.set('n', '\\', toggle_files, right_opts)
   vim.keymap.set('n', '<Tab>', function()
-    if vim.api.nvim_win_is_valid(left_win) then
+    if not left_win or not vim.api.nvim_win_is_valid(left_win) then
+      toggle_files()
+      if left_win and vim.api.nvim_win_is_valid(left_win) then
+        vim.api.nvim_set_current_win(left_win)
+      end
+    else
       vim.api.nvim_set_current_win(left_win)
     end
   end, right_opts)
@@ -1806,20 +2014,35 @@ end
 local function open_threads_window(title, threads, ctx_id, overview)
   local groups, total = group_threads_by_file(threads)
 
-  local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
-  local left_content_w = 38
-  local right_content_w = total_w - left_content_w - 4
-  if right_content_w < 40 then
-    left_content_w = math.max(20, total_w - 44)
-    right_content_w = total_w - left_content_w - 4
+  local function compute_geom()
+    local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+    local left_content_w = 38
+    local right_content_w = total_w - left_content_w - 4
+    if right_content_w < 40 then
+      left_content_w = math.max(20, total_w - 44)
+      right_content_w = total_w - left_content_w - 4
+    end
+    local height = math.min(50, math.floor(vim.o.lines * 0.9))
+    local statusline = vim.o.laststatus > 0 and 1 or 0
+    local available = vim.o.lines - vim.o.cmdheight - statusline
+    local row = math.floor((available - height) / 2)
+    local total_col_start = math.floor((vim.o.columns - total_w) / 2)
+    local left_col = total_col_start + 1
+    local right_col = left_col + left_content_w + 2
+    return {
+      total_w = total_w,
+      left_content_w = left_content_w,
+      right_content_w = right_content_w,
+      height = height,
+      row = row,
+      total_col_start = total_col_start,
+      left_col = left_col,
+      right_col = right_col,
+    }
   end
-  local height = math.min(50, math.floor(vim.o.lines * 0.9))
-  local statusline = vim.o.laststatus > 0 and 1 or 0
-  local available = vim.o.lines - vim.o.cmdheight - statusline
-  local row = math.floor((available - height) / 2)
-  local total_col_start = math.floor((vim.o.columns - total_w) / 2)
-  local left_col = total_col_start + 1
-  local right_col = left_col + left_content_w + 2
+
+  local geom = compute_geom()
+  local file_start_lines = {}
 
   -- Right (threads) buffer + window
   local right_buf = vim.api.nvim_create_buf(false, true)
@@ -1828,10 +2051,10 @@ local function open_threads_window(title, threads, ctx_id, overview)
 
   local right_win = vim.api.nvim_open_win(right_buf, false, {
     relative = 'editor',
-    width = right_content_w,
-    height = height,
-    row = row,
-    col = right_col,
+    width = geom.right_content_w,
+    height = geom.height,
+    row = geom.row,
+    col = geom.right_col,
     style = 'minimal',
     border = 'rounded',
     title = ' ' .. title .. ' ',
@@ -1846,252 +2069,356 @@ local function open_threads_window(title, threads, ctx_id, overview)
   vim.wo[right_win].winhighlight =
     'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
 
-  -- Render threads grouped by file; record per-file start line
-  local lines = {}
-  local line_bgs = {}
-  local range_hls = {}
-  local file_start_lines = {}
+  local function render_right(content_w)
+    local lines = {}
+    local line_bgs = {}
+    local range_hls = {}
+    file_start_lines = {}
 
-  local function push_raw(text)
-    table.insert(lines, text)
-    return #lines - 1
-  end
-  local function push_bg(text, bg)
-    local idx = push_raw(text)
-    if bg then
-      table.insert(line_bgs, { line = idx, hl = bg })
+    local function push_raw(text)
+      table.insert(lines, text)
+      return #lines - 1
     end
-    return idx
-  end
-  local function push_seg(segs)
-    local text = ''
-    local local_hls = {}
-    for _, s in ipairs(segs) do
-      local col_start = #text
-      text = text .. s.text
-      if s.hl then
-        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+    local function push_bg(text, bg)
+      local idx = push_raw(text)
+      if bg then
+        table.insert(line_bgs, { line = idx, hl = bg })
       end
+      return idx
     end
-    local idx = push_raw(text)
-    for _, h in ipairs(local_hls) do
-      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    local function push_seg(segs)
+      local text = ''
+      local local_hls = {}
+      for _, s in ipairs(segs) do
+        local col_start = #text
+        text = text .. s.text
+        if s.hl then
+          table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+        end
+      end
+      local idx = push_raw(text)
+      for _, h in ipairs(local_hls) do
+        table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+      end
+      return idx
     end
-    return idx
-  end
 
-  emit_pr_header_card(right_content_w, overview, push_raw, push_bg, push_seg)
+    emit_pr_header_card(content_w, overview, push_raw, push_bg, push_seg)
 
-  push_raw('')
-  push_seg {
-    { text = '  ', hl = nil },
-    { text = 'REVIEW THREADS', hl = 'Title' },
-    { text = '  ' .. ctx_id, hl = 'Comment' },
-  }
-  push_raw('')
-  if total == 0 then
+    push_raw('')
     push_seg {
       { text = '  ', hl = nil },
-      { text = '(no unresolved review threads)', hl = 'Comment' },
-    }
-  else
-    push_seg {
-      { text = '  ', hl = nil },
-      { text = ' ' .. total .. ' unresolved ', hl = 'DashboardPillWarn' },
-    }
-  end
-  push_raw('')
-  push_raw('')
-
-  local indent = '  '
-  local bar_prefix = '  │  '
-  local bar_w = vim.fn.strdisplaywidth(bar_prefix)
-  local reply_border_w = math.max(10, right_content_w - bar_w - 4)
-
-  for gi, group in ipairs(groups) do
-    local fname = group.path
-    local label = ' ' .. fname .. ' '
-    if vim.fn.strdisplaywidth(label) > right_content_w - 10 then
-      local visible = math.max(3, right_content_w - 14)
-      label = ' …' .. fname:sub(#fname - visible + 1) .. ' '
-    end
-    local pad_total = right_content_w - vim.fn.strdisplaywidth(label)
-    if pad_total < 2 then
-      pad_total = 2
-    end
-    local pad_left = math.floor(pad_total / 2)
-    local pad_right = pad_total - pad_left
-
-    file_start_lines[gi] = #lines
-    push_seg {
-      { text = string.rep('━', pad_left), hl = 'NonText' },
-      { text = label, hl = 'Title' },
-      { text = string.rep('━', pad_right), hl = 'NonText' },
+      { text = 'REVIEW THREADS', hl = 'Title' },
+      { text = '  ' .. ctx_id, hl = 'Comment' },
     }
     push_raw('')
-
-    for _, t in ipairs(group.threads) do
-      local cs = (t.comments and t.comments.nodes) or {}
-      local first = cs[1]
-      local line_num = t.line or t.originalLine or '?'
-
-      local header_segs = {
-        { text = indent, hl = nil },
-        { text = 'line ' .. tostring(line_num), hl = 'Comment' },
+    if total == 0 then
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = '(no unresolved review threads)', hl = 'Comment' },
       }
-      if t.isOutdated then
-        table.insert(header_segs, { text = '  ', hl = nil })
-        table.insert(header_segs, { text = ' outdated ', hl = 'DashboardPillMuted' })
-      end
-      push_seg(header_segs)
-      if first and first.diffHunk and first.diffHunk ~= '' then
-        for _, hline in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
-          local f = hline:sub(1, 1)
-          local hunk_bg
-          if hline:match '^@@' then
-            hunk_bg = 'DiffChange'
-          elseif f == '+' and not hline:match '^%+%+%+' then
-            hunk_bg = 'DiffAdd'
-          elseif f == '-' and not hline:match '^%-%-%-' then
-            hunk_bg = 'DiffDelete'
-          end
-          push_bg(indent .. hline, hunk_bg)
-        end
-      end
+    else
+      push_seg {
+        { text = '  ', hl = nil },
+        { text = ' ' .. total .. ' unresolved ', hl = 'DashboardPillWarn' },
+      }
+    end
+    push_raw('')
+    push_raw('')
 
-      for _, c in ipairs(cs) do
-        local author = (c.author and c.author.login) or '?'
-        local age = ago(c.createdAt)
-        local prefix_w = bar_w + 2 + vim.fn.strdisplaywidth(author)
-        local age_w = vim.fn.strdisplaywidth(age)
-        local pad_w = right_content_w - prefix_w - age_w - 4
-        if pad_w < 2 then
-          pad_w = 2
+    local indent = '  '
+    local bar_prefix = '  │  '
+    local bar_w = vim.fn.strdisplaywidth(bar_prefix)
+    local reply_border_w = math.max(10, content_w - bar_w - 4)
+
+    for gi, group in ipairs(groups) do
+      local fname = group.path
+      local label = ' ' .. fname .. ' '
+      if vim.fn.strdisplaywidth(label) > content_w - 10 then
+        local visible = math.max(3, content_w - 14)
+        label = ' …' .. fname:sub(#fname - visible + 1) .. ' '
+      end
+      local pad_total = content_w - vim.fn.strdisplaywidth(label)
+      if pad_total < 2 then
+        pad_total = 2
+      end
+      local pad_left = math.floor(pad_total / 2)
+      local pad_right = pad_total - pad_left
+
+      file_start_lines[gi] = #lines
+      push_seg {
+        { text = string.rep('━', pad_left), hl = 'NonText' },
+        { text = label, hl = 'Title' },
+        { text = string.rep('━', pad_right), hl = 'NonText' },
+      }
+      push_raw('')
+
+      for _, t in ipairs(group.threads) do
+        local cs = (t.comments and t.comments.nodes) or {}
+        local first = cs[1]
+        local line_num = t.line or t.originalLine or '?'
+
+        local header_segs = {
+          { text = indent, hl = nil },
+          { text = 'line ' .. tostring(line_num), hl = 'Comment' },
+        }
+        if t.isOutdated then
+          table.insert(header_segs, { text = '  ', hl = nil })
+          table.insert(header_segs, { text = ' outdated ', hl = 'DashboardPillMuted' })
         end
-        push_seg {
-          { text = '  ', hl = nil },
-          { text = '│', hl = 'DashboardAccentGithub' },
-        }
-        push_seg {
-          { text = '  ', hl = nil },
-          { text = '│  ', hl = 'DashboardAccentGithub' },
-          { text = '╭' .. string.rep('─', reply_border_w) .. '╮', hl = 'DashboardAccentGithub' },
-        }
-        push_seg {
-          { text = '  ', hl = nil },
-          { text = '│  ', hl = 'DashboardAccentGithub' },
-          { text = '  ', hl = nil },
-          { text = author, hl = 'Title' },
-          { text = string.rep(' ', pad_w), hl = nil },
-          { text = age, hl = 'Comment' },
-        }
-        local body_max = math.max(20, reply_border_w - 4)
-        for _, l in ipairs(wrap_text(c.body or '', body_max)) do
+        push_seg(header_segs)
+        if first and first.diffHunk and first.diffHunk ~= '' then
+          for _, hline in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
+            local f = hline:sub(1, 1)
+            local hunk_bg
+            if hline:match '^@@' then
+              hunk_bg = 'DiffChange'
+            elseif f == '+' and not hline:match '^%+%+%+' then
+              hunk_bg = 'DiffAdd'
+            elseif f == '-' and not hline:match '^%-%-%-' then
+              hunk_bg = 'DiffDelete'
+            end
+            push_bg(indent .. hline, hunk_bg)
+          end
+        end
+
+        for _, c in ipairs(cs) do
+          local author = (c.author and c.author.login) or '?'
+          local age = ago(c.createdAt)
+          local prefix_w = bar_w + 2 + vim.fn.strdisplaywidth(author)
+          local age_w = vim.fn.strdisplaywidth(age)
+          local pad_w = content_w - prefix_w - age_w - 4
+          if pad_w < 2 then
+            pad_w = 2
+          end
+          push_seg {
+            { text = '  ', hl = nil },
+            { text = '│', hl = 'DashboardAccentGithub' },
+          }
           push_seg {
             { text = '  ', hl = nil },
             { text = '│  ', hl = 'DashboardAccentGithub' },
-            { text = '  ' .. l, hl = 'Normal' },
+            { text = '╭' .. string.rep('─', reply_border_w) .. '╮', hl = 'DashboardAccentGithub' },
+          }
+          push_seg {
+            { text = '  ', hl = nil },
+            { text = '│  ', hl = 'DashboardAccentGithub' },
+            { text = '  ', hl = nil },
+            { text = author, hl = 'Title' },
+            { text = string.rep(' ', pad_w), hl = nil },
+            { text = age, hl = 'Comment' },
+          }
+          local body_max = math.max(20, reply_border_w - 4)
+          for _, l in ipairs(wrap_text(c.body or '', body_max)) do
+            push_seg {
+              { text = '  ', hl = nil },
+              { text = '│  ', hl = 'DashboardAccentGithub' },
+              { text = '  ' .. l, hl = 'Normal' },
+            }
+          end
+          push_seg {
+            { text = '  ', hl = nil },
+            { text = '│  ', hl = 'DashboardAccentGithub' },
+            { text = '╰' .. string.rep('─', reply_border_w) .. '╯', hl = 'DashboardAccentGithub' },
           }
         end
-        push_seg {
-          { text = '  ', hl = nil },
-          { text = '│  ', hl = 'DashboardAccentGithub' },
-          { text = '╰' .. string.rep('─', reply_border_w) .. '╯', hl = 'DashboardAccentGithub' },
-        }
-      end
 
+        push_raw('')
+      end
       push_raw('')
     end
-    push_raw('')
+
+    vim.bo[right_buf].modifiable = true
+    vim.api.nvim_buf_clear_namespace(right_buf, ns, 0, -1)
+    vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, lines)
+    vim.bo[right_buf].modifiable = false
+
+    for _, h in ipairs(range_hls) do
+      vim.api.nvim_buf_set_extmark(right_buf, ns, h.line, h.col_start, {
+        end_col = h.col_end,
+        hl_group = h.hl,
+        priority = 100,
+      })
+    end
+    for _, bg in ipairs(line_bgs) do
+      vim.api.nvim_buf_set_extmark(right_buf, ns, bg.line, 0, {
+        end_line = bg.line + 1,
+        end_col = 0,
+        hl_group = bg.hl,
+        hl_eol = true,
+        priority = 10,
+      })
+    end
   end
 
-  vim.bo[right_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(right_buf, 0, -1, false, lines)
-  for _, h in ipairs(range_hls) do
-    vim.api.nvim_buf_set_extmark(right_buf, ns, h.line, h.col_start, {
-      end_col = h.col_end,
-      hl_group = h.hl,
-      priority = 100,
-    })
-  end
-  for _, bg in ipairs(line_bgs) do
-    vim.api.nvim_buf_set_extmark(right_buf, ns, bg.line, 0, {
-      end_line = bg.line + 1,
-      end_col = 0,
-      hl_group = bg.hl,
-      hl_eol = true,
-      priority = 10,
-    })
-  end
-  vim.bo[right_buf].modifiable = false
+  render_right(geom.right_content_w)
 
   -- Left (file list) buffer + window
   local left_buf = vim.api.nvim_create_buf(false, true)
   vim.bo[left_buf].buftype = 'nofile'
-  vim.bo[left_buf].bufhidden = 'wipe'
+  vim.bo[left_buf].bufhidden = 'hide'
 
-  local left_win = vim.api.nvim_open_win(left_buf, true, {
-    relative = 'editor',
-    width = left_content_w,
-    height = height,
-    row = row,
-    col = left_col,
-    style = 'minimal',
-    border = 'rounded',
-    title = string.format(' Files (%d) ', #groups),
-    title_pos = 'center',
-    zindex = 60,
-  })
-  vim.wo[left_win].cursorline = true
-  vim.wo[left_win].wrap = false
-  vim.wo[left_win].winhighlight =
-    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
-
-  local list_lines = {}
-  local list_hls = {}
-  local right_pad = 1
-  for _, group in ipairs(groups) do
-    local count_pill = ' ' .. tostring(#group.threads) .. ' '
-    local count_w = #count_pill
-    local path = group.path
-    local max_path = left_content_w - count_w - right_pad - 1
-    if #path > max_path and max_path > 1 then
-      path = '…' .. path:sub(#path - max_path + 2)
-    end
-    local gap = left_content_w - #path - count_w - right_pad
-    if gap < 1 then
-      gap = 1
-    end
-    local line = path .. string.rep(' ', gap) .. count_pill .. string.rep(' ', right_pad)
-    table.insert(list_lines, line)
-    local count_start = #path + gap
-    table.insert(list_hls, { line = #list_lines - 1, col_start = count_start, col_end = count_start + count_w })
+  local function left_win_config()
+    return {
+      relative = 'editor',
+      width = geom.left_content_w,
+      height = geom.height,
+      row = geom.row,
+      col = geom.left_col,
+      style = 'minimal',
+      border = 'rounded',
+      title = string.format(' Files (%d) ', #groups),
+      title_pos = 'center',
+      zindex = 60,
+    }
   end
-  if #list_lines == 0 then
-    list_lines = { '(no files with threads)' }
+  local function right_win_config_split()
+    return {
+      relative = 'editor',
+      width = geom.right_content_w,
+      height = geom.height,
+      row = geom.row,
+      col = geom.right_col,
+    }
+  end
+  local function right_win_config_full()
+    return {
+      relative = 'editor',
+      width = geom.total_w - 2,
+      height = geom.height,
+      row = geom.row,
+      col = geom.total_col_start + 1,
+    }
   end
 
-  vim.bo[left_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
-  for _, h in ipairs(list_hls) do
-    vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, h.col_start, {
-      end_col = h.col_end,
-      hl_group = 'DashboardPillWarn',
-      priority = 100,
-    })
+  local left_win = vim.api.nvim_open_win(left_buf, true, left_win_config())
+  local function apply_left_winopts()
+    vim.wo[left_win].cursorline = true
+    vim.wo[left_win].wrap = false
+    vim.wo[left_win].winhighlight =
+      'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
   end
-  vim.bo[left_buf].modifiable = false
+  apply_left_winopts()
 
-  local close = function()
-    for _, w in ipairs { left_win, right_win } do
-      if vim.api.nvim_win_is_valid(w) then
-        vim.api.nvim_win_close(w, true)
+  local function render_left(content_w)
+    local list_lines = {}
+    local list_hls = {}
+    local right_pad = 1
+    for _, group in ipairs(groups) do
+      local count_pill = ' ' .. tostring(#group.threads) .. ' '
+      local count_w = #count_pill
+      local path = group.path
+      local max_path = content_w - count_w - right_pad - 1
+      if #path > max_path and max_path > 1 then
+        path = '…' .. path:sub(#path - max_path + 2)
       end
+      local gap = content_w - #path - count_w - right_pad
+      if gap < 1 then
+        gap = 1
+      end
+      local line = path .. string.rep(' ', gap) .. count_pill .. string.rep(' ', right_pad)
+      table.insert(list_lines, line)
+      local count_start = #path + gap
+      table.insert(list_hls, { line = #list_lines - 1, col_start = count_start, col_end = count_start + count_w })
+    end
+    if #list_lines == 0 then
+      list_lines = { '(no files with threads)' }
+    end
+
+    vim.bo[left_buf].modifiable = true
+    vim.api.nvim_buf_clear_namespace(left_buf, ns, 0, -1)
+    vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
+    for _, h in ipairs(list_hls) do
+      vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, h.col_start, {
+        end_col = h.col_end,
+        hl_group = 'DashboardPillWarn',
+        priority = 100,
+      })
+    end
+    vim.bo[left_buf].modifiable = false
+  end
+
+  render_left(geom.left_content_w)
+
+  local closing = false
+  local close = function()
+    if closing then
+      return
+    end
+    closing = true
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      pcall(vim.api.nvim_win_close, left_win, true)
+    end
+    if right_win and vim.api.nvim_win_is_valid(right_win) then
+      pcall(vim.api.nvim_win_close, right_win, true)
+    end
+    if left_buf and vim.api.nvim_buf_is_valid(left_buf) then
+      pcall(vim.api.nvim_buf_delete, left_buf, { force = true })
     end
     refocus_dashboard()
   end
 
+  vim.api.nvim_create_autocmd('WinClosed', {
+    pattern = tostring(right_win),
+    callback = function()
+      vim.schedule(close)
+    end,
+  })
+
+  local function toggle_files()
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      if vim.api.nvim_get_current_win() == left_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_set_current_win(right_win)
+      end
+      pcall(vim.api.nvim_win_close, left_win, true)
+      left_win = nil
+      if right_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_win_set_config(right_win, right_win_config_full())
+        render_right(geom.total_w - 2)
+      end
+    else
+      if right_win and vim.api.nvim_win_is_valid(right_win) then
+        vim.api.nvim_win_set_config(right_win, right_win_config_split())
+        render_right(geom.right_content_w)
+      end
+      if not (left_buf and vim.api.nvim_buf_is_valid(left_buf)) then
+        return
+      end
+      left_win = vim.api.nvim_open_win(left_buf, false, left_win_config())
+      apply_left_winopts()
+    end
+  end
+
+  local function on_resize()
+    geom = compute_geom()
+    if left_win and vim.api.nvim_win_is_valid(left_win) then
+      pcall(vim.api.nvim_win_set_config, left_win, left_win_config())
+      pcall(vim.api.nvim_win_set_config, right_win, right_win_config_split())
+      render_right(geom.right_content_w)
+      render_left(geom.left_content_w)
+    else
+      pcall(vim.api.nvim_win_set_config, right_win, right_win_config_full())
+      render_right(geom.total_w - 2)
+    end
+  end
+
+  vim.api.nvim_create_autocmd('VimResized', {
+    buffer = right_buf,
+    callback = function()
+      vim.schedule(on_resize)
+    end,
+  })
+  vim.api.nvim_create_autocmd('VimResized', {
+    buffer = left_buf,
+    callback = function()
+      vim.schedule(on_resize)
+    end,
+  })
+
   local function jump_to_file()
+    if not left_win or not vim.api.nvim_win_is_valid(left_win) then
+      return
+    end
     local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
     local start_line = file_start_lines[lnum]
     if not start_line or not vim.api.nvim_win_is_valid(right_win) then
@@ -2106,6 +2433,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
   vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
+  vim.keymap.set('n', '\\', toggle_files, left_opts)
   vim.keymap.set('n', '<Tab>', function()
     if vim.api.nvim_win_is_valid(right_win) then
       vim.api.nvim_set_current_win(right_win)
@@ -2115,8 +2443,14 @@ local function open_threads_window(title, threads, ctx_id, overview)
   local right_opts = { buffer = right_buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
+  vim.keymap.set('n', '\\', toggle_files, right_opts)
   vim.keymap.set('n', '<Tab>', function()
-    if vim.api.nvim_win_is_valid(left_win) then
+    if not left_win or not vim.api.nvim_win_is_valid(left_win) then
+      toggle_files()
+      if left_win and vim.api.nvim_win_is_valid(left_win) then
+        vim.api.nvim_set_current_win(left_win)
+      end
+    else
       vim.api.nvim_set_current_win(left_win)
     end
   end, right_opts)
@@ -2639,22 +2973,86 @@ function M.show_local_diff()
               label = 'HEAD'
             end
             vim.notify('Loading local diff vs ' .. label .. '…', vim.log.levels.INFO)
+            local results = { tracked = nil, untracked = nil }
+            local pending = 2
+            local function done()
+              pending = pending - 1
+              if pending > 0 then
+                return
+              end
+              local diff = (results.tracked or '') .. (results.untracked or '')
+              if diff:gsub('%s', '') == '' then
+                vim.notify('No local changes vs ' .. label, vim.log.levels.INFO)
+                return
+              end
+              local branch = vim.fn.fnamemodify(cwd, ':t')
+              local title = string.format('%s · local vs %s', branch, label)
+              open_diff_window(title, diff, nil)
+            end
+
             vim.system({ 'git', '-C', cwd, 'diff', target }, { text = true }, function(obj)
               vim.schedule(function()
                 if obj.code ~= 0 then
                   vim.notify('git diff failed: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
-                  return
+                  results.tracked = ''
+                else
+                  results.tracked = obj.stdout or ''
                 end
-                local diff = obj.stdout or ''
-                if diff:gsub('%s', '') == '' then
-                  vim.notify('No local changes vs ' .. label, vim.log.levels.INFO)
-                  return
-                end
-                local branch = vim.fn.fnamemodify(cwd, ':t')
-                local title = string.format('%s · local vs %s', branch, label)
-                open_diff_window(title, diff, nil)
+                done()
               end)
             end)
+
+            vim.system(
+              { 'git', '-C', cwd, 'ls-files', '--others', '--exclude-standard' },
+              { text = true },
+              function(ls)
+                vim.schedule(function()
+                  if ls.code ~= 0 then
+                    results.untracked = ''
+                    done()
+                    return
+                  end
+                  local files = {}
+                  for f in (ls.stdout or ''):gmatch '[^\n]+' do
+                    table.insert(files, f)
+                  end
+                  if #files == 0 then
+                    results.untracked = ''
+                    done()
+                    return
+                  end
+                  local remaining = #files
+                  local chunks = {}
+                  for i, file in ipairs(files) do
+                    vim.system(
+                      { 'git', '-C', cwd, 'diff', '--no-index', '--', '/dev/null', file },
+                      { text = true },
+                      function(d)
+                        vim.schedule(function()
+                          -- exit code 1 means files differ, which is expected; >1 is real error
+                          if (d.code == 0 or d.code == 1) and d.stdout and d.stdout ~= '' then
+                            chunks[i] = d.stdout
+                          else
+                            chunks[i] = ''
+                          end
+                          remaining = remaining - 1
+                          if remaining == 0 then
+                            local parts = {}
+                            for j = 1, #files do
+                              if chunks[j] and chunks[j] ~= '' then
+                                table.insert(parts, chunks[j])
+                              end
+                            end
+                            results.untracked = table.concat(parts, '\n')
+                            done()
+                          end
+                        end)
+                      end
+                    )
+                  end
+                end)
+              end
+            )
           end)
         end
       )
@@ -2985,6 +3383,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   g?      this help
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
+  <leader>gd   local git diff (vs upstream) in the two-pane viewer
 
 ## Notes section
   n       new note (auto-prepends "- ")
@@ -3006,9 +3405,10 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
 ## Notifications
   x       mark notification as read
 
-## Diff viewer
-  <CR>    jump diff to selected file's hunk + focus diff pane
-  <Tab>   toggle focus (files ↔ diff)
+## Diff / threads viewer
+  <CR>    jump to selected file's hunk + focus right pane (files pane)
+  <Tab>   toggle focus (files ↔ content); re-opens files if hidden
+  \       toggle the file explorer pane (full-screen the content)
   q       close both panes
 
 ## Claude / threads window
@@ -3153,21 +3553,27 @@ function M.open()
   vim.bo[state.buf].bufhidden = 'wipe'
   vim.bo[state.buf].filetype = 'dashboard'
 
-  local width = math.min(155, math.floor(vim.o.columns * 0.92))
-  local height = math.min(44, math.floor(vim.o.lines * 0.85))
-  local statusline = vim.o.laststatus > 0 and 1 or 0
-  local available = vim.o.lines - vim.o.cmdheight - statusline
-  state.win = vim.api.nvim_open_win(state.buf, true, {
-    relative = 'editor',
-    width = width,
-    height = height,
-    row = math.floor((available - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
+  local function compute_dashboard_geom()
+    local w = math.min(155, math.floor(vim.o.columns * 0.92))
+    local h = math.min(44, math.floor(vim.o.lines * 0.85))
+    local statusline = vim.o.laststatus > 0 and 1 or 0
+    local avail = vim.o.lines - vim.o.cmdheight - statusline
+    return {
+      relative = 'editor',
+      width = w,
+      height = h,
+      row = math.floor((avail - h) / 2),
+      col = math.floor((vim.o.columns - w) / 2),
+    }
+  end
+
+  local geom = compute_dashboard_geom()
+  state.win = vim.api.nvim_open_win(state.buf, true, vim.tbl_extend('force', geom, {
     style = 'minimal',
     border = 'rounded',
     title = ' Status Dashboard ',
     title_pos = 'center',
-  })
+  }))
 
   vim.wo[state.win].cursorline = false
   vim.wo[state.win].wrap = false
@@ -3212,6 +3618,17 @@ function M.open()
       if state.last_refresh and (os.time() - state.last_refresh) > config.refresh_after then
         M.refresh()
       end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd('VimResized', {
+    buffer = state.buf,
+    callback = function()
+      if not (state.win and vim.api.nvim_win_is_valid(state.win)) then
+        return
+      end
+      pcall(vim.api.nvim_win_set_config, state.win, compute_dashboard_geom())
+      render()
     end,
   })
 
