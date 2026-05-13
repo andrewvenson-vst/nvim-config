@@ -204,11 +204,65 @@ local function buf_valid()
   return state.buf and vim.api.nvim_buf_is_valid(state.buf)
 end
 
-local function refocus_dashboard()
+local function compute_dashboard_geom()
+  local w = math.min(155, math.floor(vim.o.columns * 0.92))
+  local h = math.min(44, math.floor(vim.o.lines * 0.85))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local avail = vim.o.lines - vim.o.cmdheight - statusline
+  return {
+    relative = 'editor',
+    width = w,
+    height = h,
+    row = math.floor((avail - h) / 2),
+    col = math.floor((vim.o.columns - w) / 2),
+  }
+end
+
+local function show_loading(text)
+  vim.api.nvim_echo({ { text, 'Comment' } }, false, {})
+end
+local function clear_loading()
+  vim.api.nvim_echo({}, false, {})
+end
+
+local function hide_dashboard()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
-    pcall(vim.api.nvim_set_current_win, state.win)
+    if state.win == vim.api.nvim_get_current_win() then
+      state.dashboard_cursor = vim.api.nvim_win_get_cursor(state.win)
+    end
+    pcall(vim.api.nvim_win_close, state.win, true)
+    state.win = nil
   end
 end
+
+local function restore_dashboard()
+  if state.win and vim.api.nvim_win_is_valid(state.win) then
+    pcall(vim.api.nvim_set_current_win, state.win)
+    return
+  end
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    M.open()
+  end
+end
+
+local function on_viewer_open()
+  state.viewer_count = (state.viewer_count or 0) + 1
+  if state.viewer_count == 1 then
+    hide_dashboard()
+  end
+end
+
+local function on_viewer_close()
+  state.viewer_count = math.max(0, (state.viewer_count or 1) - 1)
+  vim.schedule(function()
+    if state.viewer_count == 0 then
+      restore_dashboard()
+    end
+  end)
+end
+
+-- Back-compat name used throughout the close paths.
+local refocus_dashboard = on_viewer_close
 
 local function emit(lines, segments)
   local text = ''
@@ -1350,16 +1404,68 @@ local function focus_diff_viewer()
   return false
 end
 
--- Highlight code inside a diff body using treesitter, per-file with the file's
--- language. The diff body is structured as alternating file headers and hunks;
--- for each file we strip the +/-/space prefix from code lines, parse the
--- result with treesitter, and apply each capture as an extmark in the actual
--- buffer (column offset by 1 to skip the prefix).
-local function apply_diff_language_highlights(buf, body_lines, header_len)
+-- Apply per-language treesitter highlights to a list of pre-built blocks.
+-- Each block has { lang, lines = { { buf_row, content } } } where `content`
+-- is the code text with any +/-/space (and possibly indent) prefix stripped.
+-- `col_offset` is added to every column so the highlights land on the code
+-- portion of the buffer line (1 for raw diff, more if the line is indented).
+local function apply_ts_highlights_blocks(buf, blocks, col_offset)
   if not (vim.treesitter and vim.treesitter.get_string_parser) then
     return
   end
+  for _, block in ipairs(blocks) do
+    if block.lang and #block.lines > 0 then
+      local src_lines = {}
+      for _, item in ipairs(block.lines) do
+        table.insert(src_lines, item.content)
+      end
+      local source = table.concat(src_lines, '\n')
+      if source ~= '' then
+        local ok_lang = pcall(vim.treesitter.language.add, block.lang)
+        if ok_lang then
+          local ok_parser, parser = pcall(vim.treesitter.get_string_parser, source, block.lang)
+          if ok_parser and parser then
+            local trees = parser:parse()
+            local tree = trees and trees[1]
+            local ok_q, query = pcall(vim.treesitter.query.get, block.lang, 'highlights')
+            if tree and ok_q and query then
+              for id, node in query:iter_captures(tree:root(), source, 0, -1) do
+                local capture_name = query.captures[id]
+                local hl_group = '@' .. capture_name .. '.' .. block.lang
+                local srow, scol, erow, ecol = node:range()
+                local s_item = block.lines[srow + 1]
+                local e_item = block.lines[erow + 1] or s_item
+                if s_item then
+                  pcall(vim.api.nvim_buf_set_extmark, buf, ns, s_item.buf_row, scol + col_offset, {
+                    end_row = e_item and e_item.buf_row or s_item.buf_row,
+                    end_col = ecol + col_offset,
+                    hl_group = hl_group,
+                    priority = 200,
+                  })
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
 
+local function detect_ts_lang(path)
+  local ok, ft = pcall(vim.filetype.match, { filename = path })
+  local lang = ok and ft or nil
+  if lang then
+    local ok2, ts_lang = pcall(vim.treesitter.language.get_lang, lang)
+    if ok2 and ts_lang then
+      lang = ts_lang
+    end
+  end
+  return lang
+end
+
+-- Build blocks from a standard unified diff body (with file headers).
+local function diff_body_blocks(body_lines, header_len)
   local blocks = {}
   local current
   for i, line in ipairs(body_lines) do
@@ -1368,15 +1474,7 @@ local function apply_diff_language_highlights(buf, body_lines, header_len)
         table.insert(blocks, current)
       end
       local path = line:match 'b/(.+)$' or ''
-      local ok, ft = pcall(vim.filetype.match, { filename = path })
-      local lang = ok and ft or nil
-      if lang then
-        -- Map filetype to treesitter language (often same, sometimes not).
-        local ok2, ts_lang = pcall(vim.treesitter.language.get_lang, lang)
-        if ok2 and ts_lang then
-          lang = ts_lang
-        end
-      end
+      local lang = detect_ts_lang(path)
       current = lang and { lang = lang, lines = {} } or nil
     elseif line:match '^index ' or line:match '^%+%+%+' or line:match '^%-%-%-' or line:match '^@@' then
       -- diff metadata: skip
@@ -1387,54 +1485,16 @@ local function apply_diff_language_highlights(buf, body_lines, header_len)
   if current and #current.lines > 0 then
     table.insert(blocks, current)
   end
+  return blocks
+end
 
-  for _, block in ipairs(blocks) do
-    local src_lines = {}
-    for _, item in ipairs(block.lines) do
-      table.insert(src_lines, item.content)
-    end
-    local source = table.concat(src_lines, '\n')
-    if source == '' then
-      goto continue
-    end
-
-    local ok_lang = pcall(vim.treesitter.language.add, block.lang)
-    if not ok_lang then
-      goto continue
-    end
-    local ok_parser, parser = pcall(vim.treesitter.get_string_parser, source, block.lang)
-    if not ok_parser or not parser then
-      goto continue
-    end
-    local tree = parser:parse() and parser:parse()[1]
-    if not tree then
-      goto continue
-    end
-    local ok_q, query = pcall(vim.treesitter.query.get, block.lang, 'highlights')
-    if not ok_q or not query then
-      goto continue
-    end
-
-    for id, node in query:iter_captures(tree:root(), source, 0, -1) do
-      local capture_name = query.captures[id]
-      local hl_group = '@' .. capture_name .. '.' .. block.lang
-      local srow, scol, erow, ecol = node:range()
-      local s_item = block.lines[srow + 1]
-      local e_item = block.lines[erow + 1] or s_item
-      if s_item then
-        pcall(vim.api.nvim_buf_set_extmark, buf, ns, s_item.buf_row, scol + 1, {
-          end_row = e_item and e_item.buf_row or s_item.buf_row,
-          end_col = ecol + 1,
-          hl_group = hl_group,
-          priority = 200,
-        })
-      end
-    end
-    ::continue::
-  end
+local function apply_diff_language_highlights(buf, body_lines, header_len)
+  apply_ts_highlights_blocks(buf, diff_body_blocks(body_lines, header_len), 1)
 end
 
 local function open_diff_window(title, body, overview)
+  on_viewer_open()
+  clear_loading()
   local files = parse_diff(body)
   local body_lines = vim.split(body or '', '\n', { plain = true })
 
@@ -1482,27 +1542,23 @@ local function open_diff_window(title, body, overview)
   end
 
   local function compute_geom()
-    local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+    local dash = compute_dashboard_geom()
+    local total_w = dash.width
     local left_content_w = 35
     local right_content_w = total_w - left_content_w - 4
     if right_content_w < 40 then
       left_content_w = math.max(20, total_w - 44)
       right_content_w = total_w - left_content_w - 4
     end
-    local height = math.min(50, math.floor(vim.o.lines * 0.9))
-    local statusline = vim.o.laststatus > 0 and 1 or 0
-    local available = vim.o.lines - vim.o.cmdheight - statusline
-    local row = math.floor((available - height) / 2)
-    local total_col_start = math.floor((vim.o.columns - total_w) / 2)
-    local left_col = total_col_start + 1
+    local left_col = dash.col + 1
     local right_col = left_col + left_content_w + 2
     return {
       total_w = total_w,
       left_content_w = left_content_w,
       right_content_w = right_content_w,
-      height = height,
-      row = row,
-      total_col_start = total_col_start,
+      height = dash.height,
+      row = dash.row,
+      total_col_start = dash.col,
       left_col = left_col,
       right_col = right_col,
     }
@@ -2012,30 +2068,28 @@ local function group_threads_by_file(threads)
 end
 
 local function open_threads_window(title, threads, ctx_id, overview)
+  on_viewer_open()
+  clear_loading()
   local groups, total = group_threads_by_file(threads)
 
   local function compute_geom()
-    local total_w = math.min(160, math.floor(vim.o.columns * 0.9))
+    local dash = compute_dashboard_geom()
+    local total_w = dash.width
     local left_content_w = 38
     local right_content_w = total_w - left_content_w - 4
     if right_content_w < 40 then
       left_content_w = math.max(20, total_w - 44)
       right_content_w = total_w - left_content_w - 4
     end
-    local height = math.min(50, math.floor(vim.o.lines * 0.9))
-    local statusline = vim.o.laststatus > 0 and 1 or 0
-    local available = vim.o.lines - vim.o.cmdheight - statusline
-    local row = math.floor((available - height) / 2)
-    local total_col_start = math.floor((vim.o.columns - total_w) / 2)
-    local left_col = total_col_start + 1
+    local left_col = dash.col + 1
     local right_col = left_col + left_content_w + 2
     return {
       total_w = total_w,
       left_content_w = left_content_w,
       right_content_w = right_content_w,
-      height = height,
-      row = row,
-      total_col_start = total_col_start,
+      height = dash.height,
+      row = dash.row,
+      total_col_start = dash.col,
       left_col = left_col,
       right_col = right_col,
     }
@@ -2073,6 +2127,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
     local lines = {}
     local line_bgs = {}
     local range_hls = {}
+    local ts_blocks = {}
     file_start_lines = {}
 
     local function push_raw(text)
@@ -2132,6 +2187,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
     local reply_border_w = math.max(10, content_w - bar_w - 4)
 
     for gi, group in ipairs(groups) do
+      local group_lang = detect_ts_lang(group.path)
       local fname = group.path
       local label = ' ' .. fname .. ' '
       if vim.fn.strdisplaywidth(label) > content_w - 10 then
@@ -2168,17 +2224,28 @@ local function open_threads_window(title, threads, ctx_id, overview)
         end
         push_seg(header_segs)
         if first and first.diffHunk and first.diffHunk ~= '' then
+          local hunk_block = group_lang and { lang = group_lang, lines = {} } or nil
           for _, hline in ipairs(vim.split(first.diffHunk, '\n', { plain = true })) do
             local f = hline:sub(1, 1)
-            local hunk_bg
+            local hunk_bg, is_code = nil, false
             if hline:match '^@@' then
               hunk_bg = 'DiffChange'
             elseif f == '+' and not hline:match '^%+%+%+' then
               hunk_bg = 'DiffAdd'
+              is_code = true
             elseif f == '-' and not hline:match '^%-%-%-' then
               hunk_bg = 'DiffDelete'
+              is_code = true
+            elseif f == ' ' or hline ~= '' then
+              is_code = true
             end
-            push_bg(indent .. hline, hunk_bg)
+            local idx = push_bg(indent .. hline, hunk_bg)
+            if is_code and hunk_block then
+              table.insert(hunk_block.lines, { buf_row = idx, content = hline:sub(2) })
+            end
+          end
+          if hunk_block and #hunk_block.lines > 0 then
+            table.insert(ts_blocks, hunk_block)
           end
         end
 
@@ -2249,6 +2316,9 @@ local function open_threads_window(title, threads, ctx_id, overview)
         priority = 10,
       })
     end
+
+    -- col_offset = #indent (2) + 1 (the +/-/space prefix) = 3
+    apply_ts_highlights_blocks(right_buf, ts_blocks, #indent + 1)
   end
 
   render_right(geom.right_content_w)
@@ -2919,7 +2989,7 @@ function M.threads_under_cursor()
     return
   end
   local title = string.format('Threads · %s#%d', m.pr.repo, m.pr.number)
-  vim.notify('Loading review threads…', vim.log.levels.INFO)
+  show_loading('Loading review threads…')
 
   local results = { threads = nil, overview = nil }
   local pending = 2
@@ -2972,7 +3042,7 @@ function M.show_local_diff()
               target = 'HEAD'
               label = 'HEAD'
             end
-            vim.notify('Loading local diff vs ' .. label .. '…', vim.log.levels.INFO)
+            show_loading('Loading local diff vs ' .. label .. '…')
             local results = { tracked = nil, untracked = nil }
             local pending = 2
             local function done()
@@ -3069,7 +3139,7 @@ function M.diff_under_cursor()
     focus_diff_viewer()
     return
   end
-  vim.notify('Loading diff…', vim.log.levels.INFO)
+  show_loading('Loading diff…')
 
   local results = { diff = nil, overview = nil }
   local pending = 2
@@ -3101,23 +3171,20 @@ function M.diff_under_cursor()
 end
 
 function open_result_window(title, on_reprompt, loading_text)
+  on_viewer_open()
   loading_text = loading_text or 'Loading…'
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = 'markdown'
   vim.bo[buf].buftype = 'nofile'
   vim.bo[buf].bufhidden = 'wipe'
 
-  local width = math.min(110, math.floor(vim.o.columns * 0.75))
-  local height = math.min(35, math.floor(vim.o.lines * 0.7))
-  local statusline = vim.o.laststatus > 0 and 1 or 0
-  local available = vim.o.lines - vim.o.cmdheight - statusline
-
+  local dash = compute_dashboard_geom()
   local win = vim.api.nvim_open_win(buf, true, {
     relative = 'editor',
-    width = width,
-    height = height,
-    row = math.floor((available - height) / 2),
-    col = math.floor((vim.o.columns - width) / 2),
+    width = dash.width,
+    height = dash.height,
+    row = dash.row,
+    col = dash.col,
     style = 'minimal',
     border = 'rounded',
     title = ' ' .. title .. ' ',
@@ -3358,9 +3425,14 @@ function M.close()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_win_close(state.win, true)
   end
+  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
+    pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
+  end
   state.win = nil
   state.buf = nil
   state.line_meta = {}
+  state.dashboard_cursor = nil
+  state.viewer_count = 0
 end
 
 function M.focus_last_result()
@@ -3543,28 +3615,26 @@ function M.refresh()
   jira.assigned_active(update 'jira_active')
 end
 
+local function apply_dashboard_win_opts()
+  vim.wo[state.win].cursorline = false
+  vim.wo[state.win].wrap = false
+  vim.wo[state.win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
+  vim.wo[state.win].sidescrolloff = 4
+end
+
 function M.open()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_set_current_win(state.win)
     return
   end
 
-  state.buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[state.buf].bufhidden = 'wipe'
-  vim.bo[state.buf].filetype = 'dashboard'
+  local restoring = state.buf and vim.api.nvim_buf_is_valid(state.buf)
 
-  local function compute_dashboard_geom()
-    local w = math.min(155, math.floor(vim.o.columns * 0.92))
-    local h = math.min(44, math.floor(vim.o.lines * 0.85))
-    local statusline = vim.o.laststatus > 0 and 1 or 0
-    local avail = vim.o.lines - vim.o.cmdheight - statusline
-    return {
-      relative = 'editor',
-      width = w,
-      height = h,
-      row = math.floor((avail - h) / 2),
-      col = math.floor((vim.o.columns - w) / 2),
-    }
+  if not restoring then
+    state.buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[state.buf].bufhidden = 'hide'
+    vim.bo[state.buf].filetype = 'dashboard'
   end
 
   local geom = compute_dashboard_geom()
@@ -3575,11 +3645,14 @@ function M.open()
     title_pos = 'center',
   }))
 
-  vim.wo[state.win].cursorline = false
-  vim.wo[state.win].wrap = false
-  vim.wo[state.win].winhighlight =
-    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
-  vim.wo[state.win].sidescrolloff = 4
+  apply_dashboard_win_opts()
+
+  if restoring then
+    if state.dashboard_cursor then
+      pcall(vim.api.nvim_win_set_cursor, state.win, state.dashboard_cursor)
+    end
+    return
+  end
 
   local opts = { buffer = state.buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', M.close, opts)
