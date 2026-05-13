@@ -218,6 +218,20 @@ local function compute_dashboard_geom()
   }
 end
 
+local function compute_viewer_geom()
+  local w = math.min(220, math.floor(vim.o.columns * 0.97))
+  local h = math.min(70, math.floor(vim.o.lines * 0.94))
+  local statusline = vim.o.laststatus > 0 and 1 or 0
+  local avail = vim.o.lines - vim.o.cmdheight - statusline
+  return {
+    relative = 'editor',
+    width = w,
+    height = h,
+    row = math.floor((avail - h) / 2),
+    col = math.floor((vim.o.columns - w) / 2),
+  }
+end
+
 local function show_loading(text)
   vim.api.nvim_echo({ { text, 'Comment' } }, false, {})
 end
@@ -1542,7 +1556,7 @@ local function open_diff_window(title, body, overview)
   end
 
   local function compute_geom()
-    local dash = compute_dashboard_geom()
+    local dash = compute_viewer_geom()
     local total_w = dash.width
     local left_content_w = 35
     local right_content_w = total_w - left_content_w - 4
@@ -2073,7 +2087,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
   local groups, total = group_threads_by_file(threads)
 
   local function compute_geom()
-    local dash = compute_dashboard_geom()
+    local dash = compute_viewer_geom()
     local total_w = dash.width
     local left_content_w = 38
     local right_content_w = total_w - left_content_w - 4
