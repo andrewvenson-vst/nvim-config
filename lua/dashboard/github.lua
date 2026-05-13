@@ -207,4 +207,43 @@ function M.fetch_notifications(callback)
   end)
 end
 
+function M.fetch_pr_overview(repo, number, callback)
+  vim.system({
+    'gh',
+    'pr',
+    'view',
+    tostring(number),
+    '--repo',
+    repo,
+    '--json',
+    'number,title,body,author,state,baseRefName,headRefName,labels',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('gh exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' then
+        callback(nil, 'json parse error')
+        return
+      end
+      local labels = {}
+      for _, l in ipairs(parsed.labels or {}) do
+        table.insert(labels, l.name)
+      end
+      callback {
+        number = parsed.number,
+        title = parsed.title,
+        body = parsed.body,
+        author = (parsed.author and parsed.author.login) or '?',
+        state = parsed.state,
+        base = parsed.baseRefName,
+        head = parsed.headRefName,
+        labels = labels,
+      }
+    end)
+  end)
+end
+
 return M
