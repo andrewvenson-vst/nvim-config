@@ -22,6 +22,10 @@ function M.setup(opts)
   vim.keymap.set('n', '<leader>or', function()
     require('dashboard.ui').focus_last_result()
   end, { desc = '[O]pen last [R]esult window' })
+
+  vim.keymap.set('n', '<leader>gd', function()
+    require('dashboard.ui').show_local_diff()
+  end, { desc = '[G]it local [D]iff (vs upstream)' })
 end
 
 return M

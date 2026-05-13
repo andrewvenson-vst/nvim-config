@@ -1554,6 +1554,8 @@ local function open_diff_window(title, body, overview)
   })
   vim.wo[left_win].cursorline = true
   vim.wo[left_win].wrap = false
+  vim.wo[left_win].winhighlight =
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
 
   -- Render file list
   local list_lines = {}
@@ -1597,14 +1599,26 @@ local function open_diff_window(title, body, overview)
 
   state.last_result_win = right_win
 
+  local closing = false
   local close = function()
+    if closing then
+      return
+    end
+    closing = true
     for _, w in ipairs { left_win, right_win } do
       if vim.api.nvim_win_is_valid(w) then
-        vim.api.nvim_win_close(w, true)
+        pcall(vim.api.nvim_win_close, w, true)
       end
     end
     refocus_dashboard()
   end
+
+  vim.api.nvim_create_autocmd('WinClosed', {
+    pattern = { tostring(left_win), tostring(right_win) },
+    callback = function()
+      vim.schedule(close)
+    end,
+  })
 
   local function jump_to_file()
     local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
@@ -2569,6 +2583,51 @@ function M.threads_under_cursor()
   require('dashboard.github').fetch_pr_overview(m.pr.repo, m.pr.number, function(overview)
     results.overview = overview
     done()
+  end)
+end
+
+function M.show_local_diff()
+  local cwd = vim.fn.getcwd()
+  vim.system({ 'git', '-C', cwd, 'rev-parse', '--is-inside-work-tree' }, { text = true }, function(check)
+    vim.schedule(function()
+      if check.code ~= 0 then
+        vim.notify('Not inside a git repository', vim.log.levels.WARN)
+        return
+      end
+      vim.system(
+        { 'git', '-C', cwd, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}' },
+        { text = true },
+        function(up)
+          vim.schedule(function()
+            local target, label
+            if up.code == 0 then
+              target = vim.trim(up.stdout or '')
+              label = target
+            else
+              target = 'HEAD'
+              label = 'HEAD'
+            end
+            vim.notify('Loading local diff vs ' .. label .. '…', vim.log.levels.INFO)
+            vim.system({ 'git', '-C', cwd, 'diff', target }, { text = true }, function(obj)
+              vim.schedule(function()
+                if obj.code ~= 0 then
+                  vim.notify('git diff failed: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
+                  return
+                end
+                local diff = obj.stdout or ''
+                if diff:gsub('%s', '') == '' then
+                  vim.notify('No local changes vs ' .. label, vim.log.levels.INFO)
+                  return
+                end
+                local branch = vim.fn.fnamemodify(cwd, ':t')
+                local title = string.format('%s · local vs %s', branch, label)
+                open_diff_window(title, diff, nil)
+              end)
+            end)
+          end)
+        end
+      )
+    end)
   end)
 end
 
