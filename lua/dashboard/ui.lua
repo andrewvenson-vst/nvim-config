@@ -13,6 +13,8 @@ local state = {
   last_refresh = nil,
   filter = nil,
   last_result_win = nil,
+  diff_left_win = nil,
+  diff_right_win = nil,
 }
 
 local pending_hls = {}
@@ -1331,6 +1333,23 @@ local function parse_diff(diff_text)
   return files
 end
 
+local function diff_viewer_open()
+  return (state.diff_left_win and vim.api.nvim_win_is_valid(state.diff_left_win))
+    or (state.diff_right_win and vim.api.nvim_win_is_valid(state.diff_right_win))
+end
+
+local function focus_diff_viewer()
+  if state.diff_left_win and vim.api.nvim_win_is_valid(state.diff_left_win) then
+    vim.api.nvim_set_current_win(state.diff_left_win)
+    return true
+  end
+  if state.diff_right_win and vim.api.nvim_win_is_valid(state.diff_right_win) then
+    vim.api.nvim_set_current_win(state.diff_right_win)
+    return true
+  end
+  return false
+end
+
 local function open_diff_window(title, body, overview)
   local files = parse_diff(body)
 
@@ -1598,6 +1617,8 @@ local function open_diff_window(title, body, overview)
   vim.bo[left_buf].modifiable = false
 
   state.last_result_win = right_win
+  state.diff_left_win = left_win
+  state.diff_right_win = right_win
 
   local closing = false
   local close = function()
@@ -1609,6 +1630,12 @@ local function open_diff_window(title, body, overview)
       if vim.api.nvim_win_is_valid(w) then
         pcall(vim.api.nvim_win_close, w, true)
       end
+    end
+    if state.diff_left_win == left_win then
+      state.diff_left_win = nil
+    end
+    if state.diff_right_win == right_win then
+      state.diff_right_win = nil
     end
     refocus_dashboard()
   end
@@ -2587,6 +2614,10 @@ function M.threads_under_cursor()
 end
 
 function M.show_local_diff()
+  if diff_viewer_open() then
+    focus_diff_viewer()
+    return
+  end
   local cwd = vim.fn.getcwd()
   vim.system({ 'git', '-C', cwd, 'rev-parse', '--is-inside-work-tree' }, { text = true }, function(check)
     vim.schedule(function()
@@ -2634,6 +2665,10 @@ end
 function M.diff_under_cursor()
   local m = under_cursor()
   if not m or not m.pr then
+    return
+  end
+  if diff_viewer_open() then
+    focus_diff_viewer()
     return
   end
   vim.notify('Loading diff…', vim.log.levels.INFO)
