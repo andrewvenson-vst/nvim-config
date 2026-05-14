@@ -4,6 +4,8 @@ local config = {
   base_url = 'https://vitalsource.atlassian.net',
 }
 
+local adf_to_text -- forward declaration; defined further below
+
 function M.setup(opts)
   opts = opts or {}
   if opts.base_url then
@@ -35,7 +37,7 @@ local function search(jql, callback)
 
   local body = vim.json.encode({
     jql = jql,
-    fields = { 'summary', 'status', 'priority', 'statuscategorychangedate', 'customfield_11615', 'comment' },
+    fields = { 'summary', 'status', 'priority', 'statuscategorychangedate', 'customfield_11615', 'comment', 'updated' },
     maxResults = 30,
   })
 
@@ -84,6 +86,14 @@ local function search(jql, callback)
       for _, issue in ipairs(parsed.issues or {}) do
         local f = issue.fields or {}
         local qa = f.customfield_11615
+        local latest_author, latest_body, latest_created
+        local raw_comments = (f.comment and f.comment.comments) or {}
+        if #raw_comments > 0 then
+          local last = raw_comments[#raw_comments]
+          latest_author = (last.author and last.author.displayName) or nil
+          latest_created = last.created
+          latest_body = adf_to_text(last.body)
+        end
         table.insert(issues, {
           key = issue.key,
           summary = f.summary or '',
@@ -91,7 +101,11 @@ local function search(jql, callback)
           url = config.base_url .. '/browse/' .. issue.key,
           qa_assignee = (qa and qa.displayName) or nil,
           status_change_at = f.statuscategorychangedate,
+          updated_at = f.updated,
           comment_count = (f.comment and f.comment.total) or 0,
+          latest_comment_author = latest_author,
+          latest_comment_body = latest_body,
+          latest_comment_created = latest_created,
         })
       end
       callback(issues)
@@ -103,7 +117,15 @@ function M.assigned_active(callback)
   search('assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
 end
 
-local function adf_to_text(node)
+function M.recent_activity(callback)
+  search(
+    '(assignee = currentUser() OR reporter = currentUser() OR "QA Assignee" = currentUser()) '
+      .. 'AND updated >= -7d ORDER BY updated DESC',
+    callback
+  )
+end
+
+adf_to_text = function(node)
   if type(node) ~= 'table' then
     return ''
   end

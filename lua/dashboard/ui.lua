@@ -758,6 +758,39 @@ local function emit_notification(lines, meta, n)
   }
 end
 
+local function emit_jira_activity(lines, meta, items)
+  local count = (type(items) == 'table') and #items or 0
+  local latest_key, latest_age = '', ''
+  local latest_age_hl = 'Comment'
+  if count > 0 then
+    local first = items[1]
+    latest_key = first.key or '?'
+    local age, hl = relative_time(first.status_change_at or first.updated)
+    latest_age = age or ''
+    latest_age_hl = hl or 'Comment'
+  end
+  local pill_text = ' ' .. tostring(count) .. ' '
+  local label_text = count == 1 and ' recent update' or ' recent updates'
+  local segments = {
+    { text = '    ', hl = nil },
+    { text = pill_text, hl = 'DashboardPillInfo' },
+    { text = label_text, hl = 'Normal' },
+  }
+  if count > 0 then
+    table.insert(segments, { text = '  ·  ', hl = 'NonText' })
+    table.insert(segments, { text = 'latest ', hl = 'Comment' })
+    table.insert(segments, { text = latest_key, hl = 'Title' })
+    table.insert(segments, { text = '  ', hl = nil })
+    table.insert(segments, { text = latest_age, hl = latest_age_hl })
+  end
+  local idx, cols = emit(lines, segments)
+  paint(idx, cols)
+  meta[idx + 1] = {
+    kind = 'jira_activity_summary',
+    items = items,
+  }
+end
+
 local function subsection_box(lines, kind)
   if not current_section_accent then
     return
@@ -1119,9 +1152,25 @@ local function render()
 
   emit_divider(lines, 'Notifications')
   emit_blank(lines)
-  emit_section(lines, meta, 'Inbox', notifications, function(ls, m, n)
+  emit_section(lines, meta, 'GitHub Inbox', notifications, function(ls, m, n)
     emit_notification(ls, m, n)
   end, 'No notifications')
+
+  -- Jira recent activity as a single compact summary row.
+  local jira_items = state.data.jira_activity
+  subsection_box(lines, 'top')
+  emit_subhead(lines, 'Jira recent', (type(jira_items) == 'table') and #jira_items or nil, 'DashboardPillInfo')
+  if jira_items == nil then
+    emit_status(lines, 'loading', 'Loading…')
+  elseif jira_items == false or type(jira_items) == 'string' then
+    emit_status(lines, 'error', type(jira_items) == 'string' and jira_items or 'Failed to load')
+  elseif #jira_items == 0 then
+    emit_status(lines, 'empty', 'No recent activity')
+  else
+    emit_jira_activity(lines, meta, jira_items)
+  end
+  subsection_box(lines, 'bottom')
+  emit_blank(lines)
 
   emit_divider(lines, 'Jira')
   emit_blank(lines)
@@ -1220,6 +1269,10 @@ function M.open_under_cursor()
   if m.kind == 'note' and m.path then
     M.close()
     vim.cmd('edit ' .. vim.fn.fnameescape(m.path))
+    return
+  end
+  if m.kind == 'jira_activity_summary' then
+    M.show_jira_activity(m.items)
     return
   end
   if m.url then
@@ -2842,6 +2895,139 @@ local function render_review_threads(buf, win, threads, ctx_id)
   vim.bo[buf].modifiable = false
 end
 
+-- Renders a list of recent Jira tickets as bordered cards. Returns a map of
+-- buf_row -> issue so a parent caller can wire <CR> to navigate into a card.
+local function render_jira_activity_list(buf, win, items)
+  vim.bo[buf].filetype = ''
+  local content_w = vim.api.nvim_win_get_width(win) - 2
+  local border_w = math.max(20, content_w - 4)
+
+  local lines = {}
+  local range_hls = {}
+  local line_to_item = {}
+
+  local function push_raw(text)
+    table.insert(lines, text)
+    return #lines - 1
+  end
+  local function push_seg(segs)
+    local text = ''
+    local local_hls = {}
+    for _, s in ipairs(segs) do
+      local col_start = #text
+      text = text .. s.text
+      if s.hl then
+        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+      end
+    end
+    local idx = push_raw(text)
+    for _, h in ipairs(local_hls) do
+      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    end
+    return idx
+  end
+
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = 'JIRA RECENT ACTIVITY', hl = 'Title' },
+    { text = '   ' .. tostring(#items) .. ' tickets', hl = 'Comment' },
+  }
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = '<CR>', hl = 'DashboardPillInfo' },
+    { text = '  open ticket    ', hl = 'Comment' },
+    { text = ' q ', hl = 'DashboardPillMuted' },
+    { text = '  close', hl = 'Comment' },
+  }
+  push_raw('')
+
+  local indent = '  '
+  for _, issue in ipairs(items) do
+    local card_start = #lines
+    push_seg {
+      { text = indent, hl = nil },
+      { text = '╭' .. string.rep('─', border_w) .. '╮', hl = 'DashboardAccentJira' },
+    }
+    local age, age_hl = relative_time(issue.status_change_at)
+    local head_segs = {
+      { text = indent, hl = nil },
+      { text = '  ', hl = nil },
+      { text = issue.key or '?', hl = 'Title' },
+      { text = '   ', hl = nil },
+      { text = ' ' .. (issue.status or '?') .. ' ', hl = jira_status_pill(issue.status) },
+    }
+    if issue.qa_assignee then
+      table.insert(head_segs, { text = '   ', hl = nil })
+      table.insert(head_segs, { text = ' QA: ' .. issue.qa_assignee .. ' ', hl = 'DashboardPillInfo' })
+    end
+    table.insert(head_segs, { text = '   ', hl = nil })
+    table.insert(head_segs, { text = age or '', hl = age_hl or 'Comment' })
+    if issue.comment_count and issue.comment_count > 0 then
+      table.insert(head_segs, { text = '  ·  ', hl = 'NonText' })
+      table.insert(head_segs, { text = tostring(issue.comment_count) .. ' comments', hl = 'Comment' })
+    end
+    push_seg(head_segs)
+
+    local body_max = math.max(20, border_w - 4)
+    for _, l in ipairs(wrap_text(issue.summary or '', body_max)) do
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '  ', hl = nil },
+        { text = l, hl = 'Normal' },
+      }
+    end
+
+    if issue.latest_comment_author and issue.latest_comment_body and issue.latest_comment_body ~= '' then
+      push_raw('')
+      local comment_age, comment_age_hl = relative_time(issue.latest_comment_created)
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '  ', hl = nil },
+        { text = '💬 ', hl = 'Comment' },
+        { text = issue.latest_comment_author, hl = 'Title' },
+        { text = '  ', hl = nil },
+        { text = comment_age or '', hl = comment_age_hl or 'Comment' },
+      }
+      local body_text = (issue.latest_comment_body or ''):gsub('%s+$', '')
+      local snippet_max_chars = math.max(80, (border_w - 6) * 3)
+      if #body_text > snippet_max_chars then
+        body_text = body_text:sub(1, snippet_max_chars) .. '…'
+      end
+      for _, l in ipairs(wrap_text(body_text, body_max)) do
+        push_seg {
+          { text = indent, hl = nil },
+          { text = '  ', hl = nil },
+          { text = l, hl = 'Comment' },
+        }
+      end
+    end
+
+    push_seg {
+      { text = indent, hl = nil },
+      { text = '╰' .. string.rep('─', border_w) .. '╯', hl = 'DashboardAccentJira' },
+    }
+    push_raw('')
+    for i = card_start, #lines - 1 do
+      line_to_item[i] = issue
+    end
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  for _, h in ipairs(range_hls) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  return line_to_item
+end
+
 local function render_jira_issue(buf, win, issue)
   vim.bo[buf].filetype = ''
   local content_w = vim.api.nvim_win_get_width(win) - 2
@@ -3111,6 +3297,43 @@ function M.comments_under_cursor()
       render_jira_issue(buf, win, issue)
     end)
   end)
+end
+
+function M.show_jira_activity(items)
+  if not items or type(items) ~= 'table' or #items == 0 then
+    vim.notify('No recent Jira activity', vim.log.levels.INFO)
+    return
+  end
+  local handle = open_result_window('Jira recent activity', nil, 'Loading…')
+  local line_to_item
+  local function show_list()
+    handle.set_content(function(buf, win)
+      line_to_item = render_jira_activity_list(buf, win, items)
+      vim.keymap.set('n', '<CR>', function()
+        local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+        local issue_meta = line_to_item and line_to_item[row]
+        if not issue_meta or not issue_meta.key then
+          return
+        end
+        handle.set_content(function(b2, _w2)
+          vim.bo[b2].modifiable = true
+          vim.api.nvim_buf_set_lines(b2, 0, -1, false, { '', '  ⠋  Loading ' .. issue_meta.key .. '…', '' })
+          vim.bo[b2].modifiable = false
+        end)
+        require('dashboard.jira').fetch_issue(issue_meta.key, function(issue, err)
+          if not issue then
+            handle.set_error(err or 'failed to fetch')
+            return
+          end
+          handle.set_content(function(b3, w3)
+            render_jira_issue(b3, w3, issue)
+            vim.keymap.set('n', 'b', show_list, { buffer = b3, nowait = true, silent = true })
+          end)
+        end)
+      end, { buffer = buf, nowait = true, silent = true })
+    end)
+  end
+  show_list()
 end
 
 function M.threads_under_cursor()
@@ -3704,6 +3927,7 @@ local function any_loading()
     or state.data.reviews == nil
     or state.data.notifications == nil
     or state.data.jira_active == nil
+    or state.data.jira_activity == nil
 end
 
 function stop_spinner()
@@ -3739,6 +3963,7 @@ function M.refresh()
     reviews = nil,
     notifications = nil,
     jira_active = nil,
+    jira_activity = nil,
   }
   start_spinner()
   render()
@@ -3768,6 +3993,7 @@ function M.refresh()
   end)
   github.fetch_notifications(update 'notifications')
   jira.assigned_active(update 'jira_active')
+  jira.recent_activity(update 'jira_activity')
 end
 
 local function apply_dashboard_win_opts()
