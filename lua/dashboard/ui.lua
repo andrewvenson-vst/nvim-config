@@ -994,6 +994,28 @@ local function count_jira_recent()
   return #j
 end
 
+local function count_reviews()
+  local r = state.data.reviews
+  if type(r) ~= 'table' then
+    return nil
+  end
+  return #r
+end
+
+local function count_passed_qa()
+  local j = state.data.jira_active
+  if type(j) ~= 'table' then
+    return nil
+  end
+  local c = 0
+  for _, issue in ipairs(j) do
+    if issue.status == 'Passed QA' then
+      c = c + 1
+    end
+  end
+  return c
+end
+
 local function badge_segments(label, count)
   local hl = (count and count > 0) and 'DashboardBadgeAlert' or 'DashboardBadgeMuted'
   local display = count == nil and '…' or tostring(count)
@@ -1005,16 +1027,23 @@ end
 
 local function emit_header(lines)
   local title_text = '  ★  Status Dashboard'
-  local gh_count = count_unread_notifications()
-  local jira_count = count_jira_recent()
-  local gh_segs = badge_segments('GH', gh_count)
-  local jira_segs = badge_segments('Jira', jira_count)
-  local badges_w = 3 -- spacer between the two pills
-  for _, s in ipairs(gh_segs) do
-    badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
-  end
-  for _, s in ipairs(jira_segs) do
-    badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
+  local badges = {
+    { 'Review', count_reviews() },
+    { 'Passed QA', count_passed_qa() },
+    { 'GH', count_unread_notifications() },
+    { 'Jira', count_jira_recent() },
+  }
+  local badge_groups = {}
+  local badges_w = 0
+  for i, b in ipairs(badges) do
+    local segs = badge_segments(b[1], b[2])
+    table.insert(badge_groups, segs)
+    for _, s in ipairs(segs) do
+      badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
+    end
+    if i < #badges then
+      badges_w = badges_w + 3
+    end
   end
   local title_w = vim.fn.strdisplaywidth(title_text)
   local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
@@ -1023,12 +1052,13 @@ local function emit_header(lines)
     { text = title_text, hl = 'Title' },
     { text = string.rep(' ', filler_w), hl = nil },
   }
-  for _, s in ipairs(gh_segs) do
-    table.insert(row, s)
-  end
-  table.insert(row, { text = '   ', hl = nil })
-  for _, s in ipairs(jira_segs) do
-    table.insert(row, s)
+  for i, segs in ipairs(badge_groups) do
+    for _, s in ipairs(segs) do
+      table.insert(row, s)
+    end
+    if i < #badge_groups then
+      table.insert(row, { text = '   ', hl = nil })
+    end
   end
   emit_segments(lines, row)
   emit_segments(lines, {
