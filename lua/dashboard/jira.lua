@@ -38,6 +38,7 @@ local function search(jql, callback)
   local body = vim.json.encode({
     jql = jql,
     fields = { 'summary', 'status', 'priority', 'statuscategorychangedate', 'customfield_11615', 'comment', 'updated' },
+    expand = 'changelog',
     maxResults = 30,
   })
 
@@ -94,6 +95,28 @@ local function search(jql, callback)
           latest_created = last.created
           latest_body = adf_to_text(last.body)
         end
+
+        local change_author, change_created, change_items
+        local histories = (issue.changelog and issue.changelog.histories) or {}
+        if #histories > 0 then
+          local newest = histories[1]
+          for _, h in ipairs(histories) do
+            if (h.created or '') > (newest.created or '') then
+              newest = h
+            end
+          end
+          change_author = (newest.author and newest.author.displayName) or nil
+          change_created = newest.created
+          change_items = {}
+          for _, it in ipairs(newest.items or {}) do
+            table.insert(change_items, {
+              field = it.field or it.fieldId or '?',
+              from = it.fromString,
+              to = it.toString,
+            })
+          end
+        end
+
         table.insert(issues, {
           key = issue.key,
           summary = f.summary or '',
@@ -106,6 +129,9 @@ local function search(jql, callback)
           latest_comment_author = latest_author,
           latest_comment_body = latest_body,
           latest_comment_created = latest_created,
+          latest_change_author = change_author,
+          latest_change_created = change_created,
+          latest_change_items = change_items,
         })
       end
       callback(issues)

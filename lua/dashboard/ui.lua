@@ -61,6 +61,20 @@ local function setup_hl()
   set('DashboardSectionBg', { bg = '#2a3045' })
   set('DashboardCardBg', { bg = '#181c26' })
   set('DashboardCardBgAlt', { bg = '#262d3f' })
+  set('DashboardOk', { fg = '#3ddc84', bold = true })
+  set('DashboardError', { fg = '#ff5c5c', bold = true })
+  set('DashboardDiffAdd', { bg = '#1f7a3a' })
+  set('DashboardDiffDelete', { bg = '#8a2828' })
+  set('DashboardDiffLineNr', { fg = '#9aa4b5' })
+  set('DashboardDiffLineNrAdd', { fg = '#eaffea', bold = true })
+  set('DashboardDiffLineNrDel', { fg = '#ffeaea', bold = true })
+  set('DashboardBadgeAlert', { bg = '#c73838', fg = '#ffffff', bold = true })
+  set('DashboardBadgeMuted', { bg = '#2a3045', fg = '#7a8090', bold = false })
+  -- Markdown inline groups for ADF-rendered Jira descriptions/comments.
+  set('@markup.strong', { bold = true })
+  set('@markup.italic', { italic = true })
+  set('@markup.raw', { fg = '#e0c890' })
+  set('@markup.link.label', { fg = '#88c8f0', underline = true })
 end
 
 local SECTION_COLORS = {
@@ -174,7 +188,7 @@ local function relative_time(iso)
   elseif diff < 30 * 86400 then
     hl = 'DiagnosticWarn'
   else
-    hl = 'DiagnosticError'
+    hl = 'DashboardError'
   end
   return label, hl
 end
@@ -259,24 +273,56 @@ local function restore_dashboard()
   end
 end
 
-local function on_viewer_open()
-  state.viewer_count = (state.viewer_count or 0) + 1
-  if state.viewer_count == 1 then
+local function on_viewer_open(win)
+  state.viewer_wins = state.viewer_wins or {}
+  if win then
+    table.insert(state.viewer_wins, win)
+  end
+  if #state.viewer_wins == 1 then
     hide_dashboard()
   end
 end
 
-local function on_viewer_close()
-  state.viewer_count = math.max(0, (state.viewer_count or 1) - 1)
+local function on_viewer_close(win)
+  if not state.viewer_wins then
+    state.viewer_wins = {}
+  end
+  if win then
+    for i, w in ipairs(state.viewer_wins) do
+      if w == win then
+        table.remove(state.viewer_wins, i)
+        break
+      end
+    end
+  end
+  if state.suppress_restore then
+    return
+  end
   vim.schedule(function()
-    if state.viewer_count == 0 then
+    if state.suppress_restore then
+      return
+    end
+    if #(state.viewer_wins or {}) == 0 then
       restore_dashboard()
     end
   end)
 end
 
--- Back-compat name used throughout the close paths.
-local refocus_dashboard = on_viewer_close
+local function refocus_dashboard(win)
+  on_viewer_close(win)
+end
+
+local function close_all_viewers()
+  state.suppress_restore = true
+  local wins = state.viewer_wins or {}
+  state.viewer_wins = {}
+  for _, w in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(w) then
+      pcall(vim.api.nvim_win_close, w, true)
+    end
+  end
+  state.suppress_restore = false
+end
 
 local function emit(lines, segments)
   local text = ''
@@ -375,7 +421,7 @@ local SPINNER_FRAMES = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧',
 local spinner_state = { timer = nil, frame_i = 1 }
 
 local function emit_status(lines, kind, text)
-  local hl = kind == 'loading' and 'Comment' or kind == 'error' and 'DiagnosticError' or 'Comment'
+  local hl = kind == 'loading' and 'Comment' or kind == 'error' and 'DashboardError' or 'Comment'
   local prefix
   if kind == 'loading' then
     prefix = SPINNER_FRAMES[spinner_state.frame_i]
@@ -523,10 +569,10 @@ end
 
 local function ci_badge(status)
   if status == 'SUCCESS' then
-    return '✓', 'DiagnosticOk'
+    return '✓', 'DashboardOk'
   end
   if status == 'FAILURE' or status == 'ERROR' then
-    return '✗', 'DiagnosticError'
+    return '✗', 'DashboardError'
   end
   if status == 'PENDING' or status == 'EXPECTED' then
     return '●', 'DiagnosticWarn'
@@ -536,11 +582,11 @@ end
 
 local function review_badge(decision, approvals)
   if decision == 'CHANGES_REQUESTED' then
-    return '✗', 'DiagnosticError'
+    return '✗', 'DashboardError'
   end
   approvals = approvals or 0
   if approvals >= 2 then
-    return '✓', 'DiagnosticOk'
+    return '✓', 'DashboardOk'
   end
   if approvals == 1 then
     return '◐', 'DiagnosticWarn'
@@ -560,10 +606,10 @@ local function jira_status_hl(status)
     return 'DiagnosticInfo'
   end
   if s:find 'block' or s:find 'impedi' then
-    return 'DiagnosticError'
+    return 'DashboardError'
   end
   if s:find 'done' or s:find 'closed' or s:find 'resolved' then
-    return 'DiagnosticOk'
+    return 'DashboardOk'
   end
   if s:find 'todo' or s:find 'to do' or s:find 'backlog' or s:find 'open' then
     return 'Comment'
@@ -888,8 +934,50 @@ local OPEN_BR = { text = '[ ', hl = 'NonText' }
 local CLOSE_BR = { text = ' ]', hl = 'NonText' }
 local GAP = { text = '   ', hl = nil }
 
+local function count_unread_notifications()
+  local n = state.data.notifications
+  if type(n) ~= 'table' then
+    return nil
+  end
+  local c = 0
+  for _, it in ipairs(n) do
+    if it.unread then
+      c = c + 1
+    end
+  end
+  return c
+end
+
+local function count_jira_recent()
+  local j = state.data.jira_activity
+  if type(j) ~= 'table' then
+    return nil
+  end
+  return #j
+end
+
+local function badge_segments(label, count)
+  local hl = (count and count > 0) and 'DashboardBadgeAlert' or 'DashboardBadgeMuted'
+  local display = count == nil and '…' or tostring(count)
+  return {
+    { text = ' ' .. label .. ' ', hl = hl },
+    { text = ' ' .. display .. ' ', hl = hl },
+  }
+end
+
 local function emit_header(lines)
   emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
+  local gh_count = count_unread_notifications()
+  local jira_count = count_jira_recent()
+  local badge_row = { { text = '  ', hl = nil } }
+  for _, s in ipairs(badge_segments('GH', gh_count)) do
+    table.insert(badge_row, s)
+  end
+  table.insert(badge_row, { text = '   ', hl = nil })
+  for _, s in ipairs(badge_segments('Jira', jira_count)) do
+    table.insert(badge_row, s)
+  end
+  emit_segments(lines, badge_row)
   emit_segments(lines, {
     { text = '  ', hl = nil },
     { text = 'g?', hl = '@keyword' },
@@ -909,9 +997,9 @@ local function emit_github_legend(lines)
   emit_legend(lines, {
     OPEN_BR,
     { text = 'CI: ', hl = 'Comment' },
-    { text = '✓', hl = 'DiagnosticOk' },
+    { text = '✓', hl = 'DashboardOk' },
     { text = ' pass · ', hl = 'Comment' },
-    { text = '✗', hl = 'DiagnosticError' },
+    { text = '✗', hl = 'DashboardError' },
     { text = ' fail · ', hl = 'Comment' },
     { text = '●', hl = 'DiagnosticWarn' },
     { text = ' pending', hl = 'Comment' },
@@ -919,13 +1007,13 @@ local function emit_github_legend(lines)
     GAP,
     OPEN_BR,
     { text = 'Review: ', hl = 'Comment' },
-    { text = '✓', hl = 'DiagnosticOk' },
+    { text = '✓', hl = 'DashboardOk' },
     { text = ' 2+ · ', hl = 'Comment' },
     { text = '◐', hl = 'DiagnosticWarn' },
     { text = ' 1 · ', hl = 'Comment' },
     { text = '○', hl = 'DiagnosticWarn' },
     { text = ' 0 · ', hl = 'Comment' },
-    { text = '✗', hl = 'DiagnosticError' },
+    { text = '✗', hl = 'DashboardError' },
     { text = ' changes', hl = 'Comment' },
     CLOSE_BR,
     GAP,
@@ -1000,7 +1088,7 @@ local function note_segments(line, kind)
   elseif kind == 'todo_done' then
     local _, e = line:find '^%s*%-%s*%[[xX]%]'
     return {
-      { text = line:sub(1, e), hl = 'DiagnosticOk' },
+      { text = line:sub(1, e), hl = 'DashboardOk' },
       { text = line:sub(e + 1), hl = 'Comment' },
     }
   end
@@ -1507,7 +1595,7 @@ local function apply_ts_highlights_blocks(buf, blocks, col_offset)
                     end_row = e_item and e_item.buf_row or s_item.buf_row,
                     end_col = ecol + col_offset,
                     hl_group = hl_group,
-                    priority = 200,
+                    priority = 250,
                   })
                 end
               end
@@ -1559,9 +1647,70 @@ local function apply_diff_language_highlights(buf, body_lines, header_len)
   apply_ts_highlights_blocks(buf, diff_body_blocks(body_lines, header_len), 1)
 end
 
+-- Pattern-based markdown highlighting for ADF-converted text (description /
+-- comment bodies). Handles headings, bold, italic, inline code, link text.
+-- col_offset is the byte position in the buffer where the line's content
+-- starts (after any indent / border chars).
+local function apply_markdown_line_hl(buf, buf_row, col_offset, line)
+  if not line or line == '' then
+    return
+  end
+  -- Heading: ^#+ followed by space — color the whole line as Title
+  local hashes_match = line:match '^(#+)%s+'
+  if hashes_match and #hashes_match <= 6 then
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns, buf_row, col_offset, {
+      end_row = buf_row,
+      end_col = col_offset + #line,
+      hl_group = 'Title',
+      priority = 200,
+    })
+    return
+  end
+  -- Inline patterns: bold, italic, inline code, links
+  local function paint(pattern, hl_group)
+    local i = 1
+    while true do
+      local s, e = line:find(pattern, i)
+      if not s then
+        break
+      end
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, buf_row, col_offset + s - 1, {
+        end_row = buf_row,
+        end_col = col_offset + e,
+        hl_group = hl_group,
+        priority = 200,
+      })
+      i = e + 1
+    end
+  end
+  paint('%*%*[^%*]+%*%*', '@markup.strong')
+  paint('`[^`]+`', '@markup.raw')
+  -- Italic: single * but not part of ** — match `_text_` instead which is
+  -- unambiguous and what adf_to_text could emit; bare * is too noisy to
+  -- pattern-match reliably.
+  paint('_[^_]+_', '@markup.italic')
+  -- Link [text](url) — color the [text] part as a link label
+  local i = 1
+  while true do
+    local s, e = line:find('%[[^%]]+%]%([^%)]+%)', i)
+    if not s then
+      break
+    end
+    local close = line:find(']', s, true)
+    if close then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, buf_row, col_offset + s - 1, {
+        end_row = buf_row,
+        end_col = col_offset + close,
+        hl_group = '@markup.link.label',
+        priority = 200,
+      })
+    end
+    i = e + 1
+  end
+end
+
 local function open_diff_window(title, body, overview, opts)
   opts = opts or {}
-  on_viewer_open()
   clear_loading()
   local files, body_lines, row_info, body_row_to_file
 
@@ -1589,11 +1738,11 @@ local function open_diff_window(title, body, overview, opts)
       elseif line:sub(1, 1) == '+' then
         new_l = new_l + 1
         info.new = new_l
-        info.bg = 'DiffAdd'
+        info.bg = 'DashboardDiffAdd'
       elseif line:sub(1, 1) == '-' then
         old_l = old_l + 1
         info.old = old_l
-        info.bg = 'DiffDelete'
+        info.bg = 'DashboardDiffDelete'
       else
         old_l = old_l + 1
         new_l = new_l + 1
@@ -1757,8 +1906,14 @@ local function open_diff_window(title, body, overview, opts)
         local old_s = info.old and string.format(fmt_old, info.old) or empty_old
         local new_s = info.new and string.format(fmt_new, info.new) or empty_new
         local gutter = ' ' .. old_s .. ' ' .. new_s .. ' │ '
+        local nr_hl = 'DashboardDiffLineNr'
+        if info.bg == 'DashboardDiffAdd' then
+          nr_hl = 'DashboardDiffLineNrAdd'
+        elseif info.bg == 'DashboardDiffDelete' then
+          nr_hl = 'DashboardDiffLineNrDel'
+        end
         vim.api.nvim_buf_set_extmark(right_buf, ns, buf_line, 0, {
-          virt_text = { { gutter, 'LineNr' } },
+          virt_text = { { gutter, nr_hl } },
           virt_text_pos = 'inline',
         })
       end
@@ -1795,6 +1950,8 @@ local function open_diff_window(title, body, overview, opts)
   vim.wo[right_win].signcolumn = 'no'
   vim.wo[right_win].winhighlight =
     'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,CursorLine:DashboardCursorLine'
+
+  on_viewer_open(right_win)
 
   render_right(geom.right_content_w)
 
@@ -1875,7 +2032,7 @@ local function open_diff_window(title, body, overview, opts)
       local del_end = del_start + #del_str
       table.insert(
         hl_ranges,
-        { line = #list_lines - 1, ranges = { { add_start, add_end, 'DiagnosticOk' }, { del_start, del_end, 'DiagnosticError' } } }
+        { line = #list_lines - 1, ranges = { { add_start, add_end, 'DashboardOk' }, { del_start, del_end, 'DashboardError' } } }
       )
     end
     if #list_lines == 0 then
@@ -1929,7 +2086,7 @@ local function open_diff_window(title, body, overview, opts)
     if state.diff_right_win == right_win then
       state.diff_right_win = nil
     end
-    refocus_dashboard()
+    refocus_dashboard(right_win)
   end
 
   vim.api.nvim_create_autocmd('WinClosed', {
@@ -2251,7 +2408,6 @@ local function group_threads_by_file(threads)
 end
 
 local function open_threads_window(title, threads, ctx_id, overview)
-  on_viewer_open()
   clear_loading()
   local groups, total = group_threads_by_file(threads)
 
@@ -2305,6 +2461,8 @@ local function open_threads_window(title, threads, ctx_id, overview)
   vim.wo[right_win].signcolumn = 'no'
   vim.wo[right_win].winhighlight =
     'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
+
+  on_viewer_open(right_win)
 
   local function render_right(content_w)
     local lines = {}
@@ -2414,10 +2572,10 @@ local function open_threads_window(title, threads, ctx_id, overview)
             if hline:match '^@@' then
               hunk_bg = 'DiffChange'
             elseif f == '+' and not hline:match '^%+%+%+' then
-              hunk_bg = 'DiffAdd'
+              hunk_bg = 'DashboardDiffAdd'
               is_code = true
             elseif f == '-' and not hline:match '^%-%-%-' then
-              hunk_bg = 'DiffDelete'
+              hunk_bg = 'DashboardDiffDelete'
               is_code = true
             elseif f == ' ' or hline ~= '' then
               is_code = true
@@ -2608,7 +2766,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
     if left_buf and vim.api.nvim_buf_is_valid(left_buf) then
       pcall(vim.api.nvim_buf_delete, left_buf, { force = true })
     end
-    refocus_dashboard()
+    refocus_dashboard(right_win)
   end
 
   vim.api.nvim_create_autocmd('WinClosed', {
@@ -2815,9 +2973,9 @@ local function render_review_threads(buf, win, threads, ctx_id)
         if hl:match '^@@' then
           hunk_bg = 'DiffChange'
         elseif f == '+' and not hl:match '^%+%+%+' then
-          hunk_bg = 'DiffAdd'
+          hunk_bg = 'DashboardDiffAdd'
         elseif f == '-' and not hl:match '^%-%-%-' then
-          hunk_bg = 'DiffDelete'
+          hunk_bg = 'DashboardDiffDelete'
         end
         push_bg(indent .. '  ' .. hl, hunk_bg)
       end
@@ -2897,6 +3055,138 @@ end
 
 -- Renders a list of recent Jira tickets as bordered cards. Returns a map of
 -- buf_row -> issue so a parent caller can wire <CR> to navigate into a card.
+local function action_badge(status, conclusion)
+  if status == 'in_progress' or status == 'queued' or status == 'waiting' or status == 'requested' or status == 'pending' then
+    return '●', 'DiagnosticWarn', status
+  end
+  if conclusion == 'success' then
+    return '✓', 'DashboardOk', 'success'
+  elseif conclusion == 'failure' or conclusion == 'timed_out' or conclusion == 'startup_failure' then
+    return '✗', 'DashboardError', conclusion
+  elseif conclusion == 'cancelled' then
+    return '⊘', 'NonText', 'cancelled'
+  elseif conclusion == 'skipped' or conclusion == 'neutral' or conclusion == 'stale' then
+    return '·', 'NonText', conclusion
+  elseif conclusion == 'action_required' then
+    return '!', 'DiagnosticWarn', 'action required'
+  end
+  return '·', 'NonText', status or '?'
+end
+
+local function render_actions_list(buf, win, items, repo)
+  vim.bo[buf].filetype = ''
+  local content_w = vim.api.nvim_win_get_width(win) - 2
+  local border_w = math.max(20, content_w - 4)
+
+  local lines = {}
+  local range_hls = {}
+  local line_to_item = {}
+
+  local function push_raw(text)
+    table.insert(lines, text)
+    return #lines - 1
+  end
+  local function push_seg(segs)
+    local text = ''
+    local local_hls = {}
+    for _, s in ipairs(segs) do
+      local col_start = #text
+      text = text .. s.text
+      if s.hl then
+        table.insert(local_hls, { col_start = col_start, col_end = #text, hl = s.hl })
+      end
+    end
+    local idx = push_raw(text)
+    for _, h in ipairs(local_hls) do
+      table.insert(range_hls, { line = idx, col_start = h.col_start, col_end = h.col_end, hl = h.hl })
+    end
+    return idx
+  end
+
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = 'GITHUB ACTIONS', hl = 'Title' },
+    { text = '   ' .. (repo or '?'), hl = 'Comment' },
+    { text = '   · ' .. tostring(#items) .. ' runs', hl = 'NonText' },
+  }
+  push_raw('')
+  push_seg {
+    { text = '  ', hl = nil },
+    { text = '<CR>', hl = 'DashboardPillInfo' },
+    { text = '  open run in browser    ', hl = 'Comment' },
+    { text = ' q ', hl = 'DashboardPillMuted' },
+    { text = '  close', hl = 'Comment' },
+  }
+  push_raw('')
+
+  if #items == 0 then
+    push_seg { { text = '  ', hl = nil }, { text = 'No workflow runs found.', hl = 'Comment' } }
+  end
+
+  local indent = '  '
+  local wf_w = 0
+  local branch_w = 0
+  for _, r in ipairs(items) do
+    wf_w = math.max(wf_w, vim.fn.strdisplaywidth(r.workflow or ''))
+    branch_w = math.max(branch_w, vim.fn.strdisplaywidth(r.branch or ''))
+  end
+  wf_w = math.min(wf_w, 32)
+  branch_w = math.min(branch_w, 28)
+
+  for _, r in ipairs(items) do
+    local glyph, glyph_hl, label = action_badge(r.status, r.conclusion)
+    local age, age_hl = relative_time(r.updated_at or r.created_at)
+    local wf = r.workflow or '?'
+    if vim.fn.strdisplaywidth(wf) > wf_w then
+      wf = wf:sub(1, wf_w - 1) .. '…'
+    end
+    local branch = r.branch or ''
+    if vim.fn.strdisplaywidth(branch) > branch_w then
+      branch = branch:sub(1, branch_w - 1) .. '…'
+    end
+    local title = r.title or ''
+    local title_max = math.max(20, border_w - wf_w - branch_w - 30)
+    if vim.fn.strdisplaywidth(title) > title_max then
+      title = title:sub(1, title_max - 1) .. '…'
+    end
+    local card_start = #lines
+    push_seg {
+      { text = indent, hl = nil },
+      { text = glyph, hl = glyph_hl },
+      { text = '  ', hl = nil },
+      { text = pad_right(label, 10), hl = glyph_hl },
+      { text = '  ', hl = nil },
+      { text = pad_right(wf, wf_w + 2), hl = 'Title' },
+      { text = pad_right(branch, branch_w + 2), hl = '@string' },
+      { text = pad_right(r.event or '', 18), hl = 'Comment' },
+      { text = string.format('%6s', age or ''), hl = age_hl or 'Comment' },
+    }
+    push_seg {
+      { text = indent, hl = nil },
+      { text = '     ', hl = nil },
+      { text = title, hl = 'Normal' },
+    }
+    push_raw('')
+    for i = card_start, #lines - 1 do
+      line_to_item[i] = r
+    end
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  for _, h in ipairs(range_hls) do
+    vim.api.nvim_buf_set_extmark(buf, ns, h.line, h.col_start, {
+      end_col = h.col_end,
+      hl_group = h.hl,
+      priority = 100,
+    })
+  end
+  return line_to_item
+end
+
 local function render_jira_activity_list(buf, win, items)
   vim.bo[buf].filetype = ''
   local content_w = vim.api.nvim_win_get_width(win) - 2
@@ -2979,6 +3269,41 @@ local function render_jira_activity_list(buf, win, items)
       }
     end
 
+    if issue.latest_change_author and issue.latest_change_items and #issue.latest_change_items > 0 then
+      push_raw('')
+      local change_age, change_age_hl = relative_time(issue.latest_change_created)
+      push_seg {
+        { text = indent, hl = nil },
+        { text = '  ', hl = nil },
+        { text = '↻ ', hl = 'DashboardAccentJira' },
+        { text = issue.latest_change_author, hl = 'Title' },
+        { text = '  ', hl = nil },
+        { text = change_age or '', hl = change_age_hl or 'Comment' },
+      }
+      for _, it in ipairs(issue.latest_change_items) do
+        local from = it.from and it.from ~= '' and it.from or '∅'
+        local to = it.to and it.to ~= '' and it.to or '∅'
+        local segs = {
+          { text = indent, hl = nil },
+          { text = '    ', hl = nil },
+          { text = it.field, hl = 'Comment' },
+          { text = '  ', hl = nil },
+        }
+        if from == '∅' then
+          table.insert(segs, { text = '+ ', hl = 'DashboardOk' })
+          table.insert(segs, { text = to, hl = 'Normal' })
+        elseif to == '∅' then
+          table.insert(segs, { text = '- ', hl = 'DashboardError' })
+          table.insert(segs, { text = from, hl = 'Normal' })
+        else
+          table.insert(segs, { text = from, hl = 'Normal' })
+          table.insert(segs, { text = '  →  ', hl = 'NonText' })
+          table.insert(segs, { text = to, hl = 'Normal' })
+        end
+        push_seg(segs)
+      end
+    end
+
     if issue.latest_comment_author and issue.latest_comment_body and issue.latest_comment_body ~= '' then
       push_raw('')
       local comment_age, comment_age_hl = relative_time(issue.latest_comment_created)
@@ -3036,6 +3361,8 @@ local function render_jira_issue(buf, win, issue)
   local lines = {}
   local line_bgs = {}
   local range_hls = {}
+  local desc_lines = {} -- { buf_row, content } for markdown highlight pass
+  local comment_md_lines = {} -- { buf_row, col_offset, content }
 
   local function push_raw(text)
     table.insert(lines, text)
@@ -3124,7 +3451,8 @@ local function render_jira_issue(buf, win, issue)
     }, hbg)
   else
     for _, l in ipairs(vim.split(desc, '\n', { plain = true })) do
-      push_bg('  ' .. l, hbg)
+      local idx = push_bg('  ' .. l, hbg)
+      table.insert(desc_lines, { buf_row = idx, content = l })
     end
   end
   push_bg('', hbg)
@@ -3178,7 +3506,8 @@ local function render_jira_issue(buf, win, issue)
       }
       local body_max = math.max(20, border_w - 4)
       for _, l in ipairs(wrap_text(c.body or '', body_max)) do
-        push_raw(indent .. '  ' .. l)
+        local idx = push_raw(indent .. '  ' .. l)
+        table.insert(comment_md_lines, { buf_row = idx, col_offset = 4, content = l })
       end
       push_seg {
         { text = indent, hl = nil },
@@ -3218,11 +3547,13 @@ local function render_jira_issue(buf, win, issue)
       }
       local body_max = math.max(20, border_w - 4)
       for _, l in ipairs(wrap_text(c.body or '', body_max)) do
-        push_seg {
+        local idx = push_seg {
           { text = '  ', hl = nil },
           { text = '│  ', hl = 'DashboardAccentJira' },
           { text = '  ' .. l, hl = 'Normal' },
         }
+        -- 2 (indent) + 5 ('│  ' = 3 bytes + 2 spaces) + 2 (inner spaces) = 9
+        table.insert(comment_md_lines, { buf_row = idx, col_offset = 9, content = l })
       end
       push_seg {
         { text = '  ', hl = nil },
@@ -3279,6 +3610,16 @@ local function render_jira_issue(buf, win, issue)
       priority = 10,
     })
   end
+
+  -- Markdown highlights over the description region (2-space indent prefix).
+  for _, dl in ipairs(desc_lines) do
+    apply_markdown_line_hl(buf, dl.buf_row, 2, dl.content)
+  end
+  -- ...and over comment bodies (per-line offset since replies are indented further).
+  for _, cl in ipairs(comment_md_lines) do
+    apply_markdown_line_hl(buf, cl.buf_row, cl.col_offset, cl.content)
+  end
+
   vim.bo[buf].modifiable = false
 end
 
@@ -3327,13 +3668,45 @@ function M.show_jira_activity(items)
           end
           handle.set_content(function(b3, w3)
             render_jira_issue(b3, w3, issue)
-            vim.keymap.set('n', 'b', show_list, { buffer = b3, nowait = true, silent = true })
+            local back_opts = { buffer = b3, nowait = true, silent = true }
+            vim.keymap.set('n', 'b', show_list, back_opts)
+            vim.keymap.set('n', 'q', show_list, back_opts)
+            vim.keymap.set('n', '<Esc>', show_list, back_opts)
           end)
         end)
       end, { buffer = buf, nowait = true, silent = true })
     end)
   end
   show_list()
+end
+
+function M.actions_under_cursor()
+  local m = under_cursor()
+  local repo
+  if m and m.pr and m.pr.repo then
+    repo = m.pr.repo
+  end
+  if not repo then
+    vim.notify('Place cursor on a PR or PR notification row first', vim.log.levels.INFO)
+    return
+  end
+  local handle = open_result_window('Actions · ' .. repo, nil, 'Loading workflow runs…')
+  require('dashboard.github').fetch_actions(repo, function(items, err)
+    if not items then
+      handle.set_error(err or 'failed to fetch')
+      return
+    end
+    handle.set_content(function(buf, win)
+      local line_to_item = render_actions_list(buf, win, items, repo)
+      vim.keymap.set('n', '<CR>', function()
+        local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+        local run = line_to_item and line_to_item[row]
+        if run and run.url then
+          vim.ui.open(run.url)
+        end
+      end, { buffer = buf, nowait = true, silent = true })
+    end)
+  end)
 end
 
 function M.threads_under_cursor()
@@ -3548,7 +3921,6 @@ function M.diff_under_cursor()
 end
 
 function open_result_window(title, on_reprompt, loading_text)
-  on_viewer_open()
   loading_text = loading_text or 'Loading…'
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = 'markdown'
@@ -3574,6 +3946,8 @@ function open_result_window(title, on_reprompt, loading_text)
   vim.wo[win].linebreak = true
   vim.wo[win].winhighlight =
     'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
+
+  on_viewer_open(win)
 
   local frames = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
   local frame_i = 1
@@ -3614,22 +3988,45 @@ function open_result_window(title, on_reprompt, loading_text)
     end)
   )
 
+  local closed = false
   local close = function()
+    if closed then
+      return
+    end
+    closed = true
     stop_spinner()
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
-    refocus_dashboard()
+    refocus_dashboard(win)
   end
   local opts = { buffer = buf, nowait = true, silent = true }
   vim.keymap.set('n', 'q', close, opts)
   vim.keymap.set('n', '<Esc>', close, opts)
+
+  vim.api.nvim_create_autocmd('WinClosed', {
+    pattern = tostring(win),
+    once = true,
+    callback = function()
+      if not closed then
+        closed = true
+        stop_spinner()
+        vim.schedule(function()
+          refocus_dashboard(win)
+        end)
+      end
+    end,
+  })
 
   local function set_content(text_or_renderer)
     stop_spinner()
     if not vim.api.nvim_buf_is_valid(buf) then
       return
     end
+    -- Re-establish close keymaps in case a previous renderer remapped them
+    -- (e.g. detail views that rebind q to a "back" action).
+    vim.keymap.set('n', 'q', close, opts)
+    vim.keymap.set('n', '<Esc>', close, opts)
     if type(text_or_renderer) == 'function' then
       vim.bo[buf].modifiable = true
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
@@ -3845,6 +4242,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   i       checkout + claude interactive in tmux pane
   D       two-pane diff viewer (file list + diff)
   t       review threads pane
+  a       last 20 GitHub Actions runs for this PR's repo
   s       claude summary
   ?       claude prompt picker (summary / understand / risks / next / code review)
 
@@ -4005,6 +4403,7 @@ local function apply_dashboard_win_opts()
 end
 
 function M.open()
+  close_all_viewers()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     vim.api.nvim_set_current_win(state.win)
     return
@@ -4045,6 +4444,7 @@ function M.open()
   vim.keymap.set('n', 'i', M.interactive_claude_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 't', M.threads_under_cursor, opts)
+  vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
   vim.keymap.set('n', 'C', M.comments_under_cursor, opts)
   vim.keymap.set('n', 'x', function()
     local m = under_cursor()

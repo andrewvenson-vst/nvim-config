@@ -207,6 +207,53 @@ function M.fetch_notifications(callback)
   end)
 end
 
+function M.fetch_actions(repo, callback)
+  if not repo or repo == '' then
+    callback(nil, 'no repo')
+    return
+  end
+  vim.system({
+    'gh',
+    'run',
+    'list',
+    '--repo',
+    repo,
+    '--limit',
+    '20',
+    '--json',
+    'conclusion,createdAt,displayTitle,event,headBranch,name,number,startedAt,status,updatedAt,url,workflowName',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('gh exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' then
+        callback(nil, 'json parse error')
+        return
+      end
+      local out = {}
+      for _, r in ipairs(parsed) do
+        table.insert(out, {
+          number = r.number,
+          workflow = r.workflowName or r.name or '?',
+          title = r.displayTitle or '',
+          branch = r.headBranch or '',
+          event = r.event or '',
+          status = r.status or '',
+          conclusion = r.conclusion or '',
+          created_at = r.createdAt,
+          started_at = r.startedAt,
+          updated_at = r.updatedAt,
+          url = r.url,
+        })
+      end
+      callback(out)
+    end)
+  end)
+end
+
 function M.fetch_pr_overview(repo, number, callback)
   vim.system({
     'gh',
