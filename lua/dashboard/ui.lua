@@ -806,6 +806,26 @@ local function emit_notification(lines, meta, n)
     notification_id = n.id,
     kind = pr_meta and 'pr' or nil,
   }
+  if n.comment_author and n.comment_body and n.comment_body ~= '' then
+    local snippet = n.comment_body:gsub('\r', ''):gsub('\n+', ' ⏎ '):gsub('%s+', ' ')
+    snippet = vim.trim(snippet)
+    local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
+    local prefix_w = 21
+    local author_w = vim.fn.strdisplaywidth(n.comment_author)
+    local max_snippet = math.max(40, win_w - prefix_w - author_w - 6)
+    if vim.fn.strdisplaywidth(snippet) > max_snippet then
+      snippet = snippet:sub(1, max_snippet - 1) .. '…'
+    end
+    local sub_idx, sub_cols = emit(lines, {
+      { text = '              ┊ ', hl = 'NonText' },
+      { text = '💬 ', hl = 'Comment' },
+      { text = n.comment_author, hl = 'Title' },
+      { text = '  ', hl = nil },
+      { text = snippet, hl = 'Comment' },
+    })
+    paint(sub_idx, sub_cols)
+    meta[sub_idx + 1] = meta[idx + 1]
+  end
 end
 
 local function emit_jira_activity(lines, meta, items)
@@ -4544,7 +4564,22 @@ function M.refresh()
     state.last_refresh = os.time()
     render()
   end)
-  github.fetch_notifications(update 'notifications')
+  github.fetch_notifications(function(result, err)
+    if not result then
+      state.data.notifications = err or false
+    else
+      state.data.notifications = result
+    end
+    state.last_refresh = os.time()
+    render()
+    if type(result) == 'table' and #result > 0 then
+      github.enrich_notifications(result, function()
+        if buf_valid() then
+          render()
+        end
+      end)
+    end
+  end)
   jira.assigned_active(update 'jira_active')
   jira.recent_activity(update 'jira_activity')
   if not state.me_account_id then

@@ -200,11 +200,50 @@ function M.fetch_notifications(callback)
           type = n.subject and n.subject.type or '',
           url = api_url_to_web(n.subject and n.subject.url) or (n.repository and n.repository.html_url),
           repo = n.repository and n.repository.full_name or '?',
+          subject_url = n.subject and n.subject.url or nil,
+          latest_comment_url = n.subject and n.subject.latest_comment_url or nil,
         })
       end
       callback(out)
     end)
   end)
+end
+
+function M.enrich_notifications(notifications, callback)
+  if not notifications or type(notifications) ~= 'table' or #notifications == 0 then
+    callback(notifications)
+    return
+  end
+  local pending = 0
+  local fired = false
+  local function check_done()
+    if pending == 0 and not fired then
+      fired = true
+      callback(notifications)
+    end
+  end
+  for _, n in ipairs(notifications) do
+    local url = n.latest_comment_url
+    if url and url ~= '' and url ~= n.subject_url then
+      pending = pending + 1
+      local path = url:gsub('^https://api%.github%.com', '')
+      vim.system({ 'gh', 'api', path }, { text = true }, function(obj)
+        vim.schedule(function()
+          pending = pending - 1
+          if obj.code == 0 then
+            local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+            if ok and type(parsed) == 'table' then
+              n.comment_author = parsed.user and parsed.user.login or nil
+              n.comment_body = parsed.body or nil
+              n.comment_created_at = parsed.created_at or parsed.updated_at or nil
+            end
+          end
+          check_done()
+        end)
+      end)
+    end
+  end
+  check_done()
 end
 
 function M.fetch_actions(repo, callback)
