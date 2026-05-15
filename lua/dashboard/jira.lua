@@ -87,16 +87,17 @@ local function search(jql, callback)
       for _, issue in ipairs(parsed.issues or {}) do
         local f = issue.fields or {}
         local qa = f.customfield_11615
-        local latest_author, latest_body, latest_created
+        local latest_author, latest_author_id, latest_body, latest_created
         local raw_comments = (f.comment and f.comment.comments) or {}
         if #raw_comments > 0 then
           local last = raw_comments[#raw_comments]
           latest_author = (last.author and last.author.displayName) or nil
+          latest_author_id = (last.author and last.author.accountId) or nil
           latest_created = last.created
           latest_body = adf_to_text(last.body)
         end
 
-        local change_author, change_created, change_items
+        local change_author, change_author_id, change_created, change_items
         local histories = (issue.changelog and issue.changelog.histories) or {}
         if #histories > 0 then
           local newest = histories[1]
@@ -106,6 +107,7 @@ local function search(jql, callback)
             end
           end
           change_author = (newest.author and newest.author.displayName) or nil
+          change_author_id = (newest.author and newest.author.accountId) or nil
           change_created = newest.created
           change_items = {}
           for _, it in ipairs(newest.items or {}) do
@@ -127,14 +129,53 @@ local function search(jql, callback)
           updated_at = f.updated,
           comment_count = (f.comment and f.comment.total) or 0,
           latest_comment_author = latest_author,
+          latest_comment_author_id = latest_author_id,
           latest_comment_body = latest_body,
           latest_comment_created = latest_created,
           latest_change_author = change_author,
+          latest_change_author_id = change_author_id,
           latest_change_created = change_created,
           latest_change_items = change_items,
         })
       end
       callback(issues)
+    end)
+  end)
+end
+
+local cached_account_id = nil
+
+function M.fetch_myself(callback)
+  if cached_account_id then
+    callback(cached_account_id)
+    return
+  end
+  local auth, err = creds()
+  if not auth then
+    callback(nil, err)
+    return
+  end
+  vim.system({
+    'curl',
+    '-sS',
+    config.base_url .. '/rest/api/3/myself',
+    '-H',
+    'Authorization: Basic ' .. auth,
+    '-H',
+    'Accept: application/json',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('curl exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' or not parsed.accountId then
+        callback(nil, 'unexpected response')
+        return
+      end
+      cached_account_id = parsed.accountId
+      callback(cached_account_id)
     end)
   end)
 end

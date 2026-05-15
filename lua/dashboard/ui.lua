@@ -1,5 +1,6 @@
 local github = require 'dashboard.github'
 local jira = require 'dashboard.jira'
+local seen = require 'dashboard.seen'
 
 local M = {}
 
@@ -63,7 +64,7 @@ local function setup_hl()
   set('DashboardCardBgAlt', { bg = '#262d3f' })
   set('DashboardOk', { fg = '#3ddc84', bold = true })
   set('DashboardError', { fg = '#ff5c5c', bold = true })
-  set('DashboardDiffAdd', { bg = '#1f7a3a' })
+  set('DashboardDiffAdd', { bg = '#1c6630' })
   set('DashboardDiffDelete', { bg = '#8a2828' })
   set('DashboardDiffLineNr', { fg = '#9aa4b5' })
   set('DashboardDiffLineNrAdd', { fg = '#eaffea', bold = true })
@@ -948,8 +949,45 @@ local function count_unread_notifications()
   return c
 end
 
-local function count_jira_recent()
+local function latest_author_of(item)
+  local c = item.latest_comment_created or ''
+  local h = item.latest_change_created or ''
+  if c == '' and h == '' then
+    return nil
+  end
+  if c >= h then
+    return item.latest_comment_author_id, item.latest_comment_author
+  end
+  return item.latest_change_author_id, item.latest_change_author
+end
+
+local function filtered_jira_recent()
   local j = state.data.jira_activity
+  if type(j) ~= 'table' then
+    return j
+  end
+  local me_id = state.me_account_id
+  local out = {}
+  for _, item in ipairs(j) do
+    local drop = false
+    if seen.is_seen(item.key, item.updated_at) then
+      drop = true
+    end
+    if not drop and me_id then
+      local author_id = latest_author_of(item)
+      if author_id and author_id == me_id then
+        drop = true
+      end
+    end
+    if not drop then
+      table.insert(out, item)
+    end
+  end
+  return out
+end
+
+local function count_jira_recent()
+  local j = filtered_jira_recent()
   if type(j) ~= 'table' then
     return nil
   end
@@ -1245,7 +1283,7 @@ local function render()
   end, 'No notifications')
 
   -- Jira recent activity as a single compact summary row.
-  local jira_items = state.data.jira_activity
+  local jira_items = filtered_jira_recent()
   subsection_box(lines, 'top')
   emit_subhead(lines, 'Jira recent', (type(jira_items) == 'table') and #jira_items or nil, 'DashboardPillInfo')
   if jira_items == nil then
@@ -2157,9 +2195,25 @@ local function open_diff_window(title, body, overview, opts)
     if not f or not vim.api.nvim_win_is_valid(right_win) then
       return
     end
+    local header_len = f.start_line - f._raw_start
+    local target_body = f._raw_start
+    for j = f._raw_start + 1, #body_lines do
+      local l = body_lines[j]
+      if l:match '^diff %-%-git ' then
+        break
+      end
+      if l:match '^@@' then
+        target_body = j
+        break
+      end
+    end
+    local target_row = target_body + header_len
     vim.api.nvim_set_current_win(right_win)
-    vim.api.nvim_win_set_cursor(right_win, { f.start_line, 0 })
-    vim.cmd 'normal! zt'
+    vim.api.nvim_win_set_cursor(right_win, { target_row, 0 })
+    -- Keep the file label virt_lines visible above by scrolling a few rows
+    -- past the file header instead of using zt (which would clip them).
+    local topline = math.max(1, f.start_line - 1)
+    pcall(vim.fn.winrestview, { topline = topline })
   end
 
   local refreshing = false
@@ -3645,11 +3699,13 @@ function M.show_jira_activity(items)
     vim.notify('No recent Jira activity', vim.log.levels.INFO)
     return
   end
+  local current_items = items
   local handle = open_result_window('Jira recent activity', nil, 'Loading…')
   local line_to_item
   local function show_list()
     handle.set_content(function(buf, win)
-      line_to_item = render_jira_activity_list(buf, win, items)
+      line_to_item = render_jira_activity_list(buf, win, current_items)
+      local list_opts = { buffer = buf, nowait = true, silent = true }
       vim.keymap.set('n', '<CR>', function()
         local row = vim.api.nvim_win_get_cursor(win)[1] - 1
         local issue_meta = line_to_item and line_to_item[row]
@@ -3674,7 +3730,33 @@ function M.show_jira_activity(items)
             vim.keymap.set('n', '<Esc>', show_list, back_opts)
           end)
         end)
-      end, { buffer = buf, nowait = true, silent = true })
+      end, list_opts)
+      vim.keymap.set('n', 'x', function()
+        local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+        local issue_meta = line_to_item and line_to_item[row]
+        if not issue_meta or not issue_meta.key then
+          return
+        end
+        seen.mark(issue_meta.key, issue_meta.updated_at or issue_meta.status_change_at)
+        local remaining = {}
+        for _, it in ipairs(current_items) do
+          if it.key ~= issue_meta.key then
+            table.insert(remaining, it)
+          end
+        end
+        current_items = remaining
+        if #current_items == 0 then
+          handle.close()
+          if buf_valid() then
+            render()
+          end
+          return
+        end
+        show_list()
+        if buf_valid() then
+          render()
+        end
+      end, list_opts)
     end)
   end
   show_list()
@@ -4252,6 +4334,10 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
 ## Notifications
   x       mark notification as read
 
+## Jira recent (inside <CR> list)
+  x       mark ticket as seen (hides until it updates again)
+  <CR>    open ticket details
+
 ## Diff / threads viewer
   <CR>    jump to selected file's hunk + focus right pane (files pane)
   <Tab>   toggle focus (files ↔ content); re-opens files if hidden
@@ -4392,6 +4478,16 @@ function M.refresh()
   github.fetch_notifications(update 'notifications')
   jira.assigned_active(update 'jira_active')
   jira.recent_activity(update 'jira_activity')
+  if not state.me_account_id then
+    jira.fetch_myself(function(id)
+      if id then
+        state.me_account_id = id
+        if buf_valid() then
+          render()
+        end
+      end
+    end)
+  end
 end
 
 local function apply_dashboard_win_opts()
