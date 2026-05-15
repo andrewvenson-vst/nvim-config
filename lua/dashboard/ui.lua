@@ -1816,10 +1816,54 @@ local function apply_markdown_line_hl(buf, buf_row, col_offset, line)
   end
 end
 
+local function build_file_tree(files)
+  local root = { name = '', path = '', children = {}, child_map = {} }
+  for _, f in ipairs(files or {}) do
+    local parts = vim.split(f.path or '', '/', { plain = true })
+    local node = root
+    for i, part in ipairs(parts) do
+      local existing = node.child_map[part]
+      if not existing then
+        local is_leaf = (i == #parts)
+        local new_path = node.path == '' and part or (node.path .. '/' .. part)
+        existing = {
+          name = part,
+          path = new_path,
+          children = {},
+          child_map = {},
+          file = is_leaf and f or nil,
+        }
+        node.child_map[part] = existing
+        table.insert(node.children, existing)
+      end
+      node = existing
+    end
+  end
+  return root
+end
+
+local function flatten_file_tree(root, collapsed)
+  local rows = {}
+  local function walk(node, depth)
+    for _, child in ipairs(node.children) do
+      local is_file = child.file ~= nil
+      table.insert(rows, { node = child, depth = depth, kind = is_file and 'file' or 'dir' })
+      if not is_file and not collapsed[child.path] then
+        walk(child, depth + 1)
+      end
+    end
+  end
+  walk(root, 0)
+  return rows
+end
+
 local function open_diff_window(title, body, overview, opts)
   opts = opts or {}
   clear_loading()
   local files, body_lines, row_info, body_row_to_file
+  local file_tree
+  local collapsed_dirs = {}
+  local rendered_rows = {}
 
   local function parse_body(b)
     files = parse_diff(b)
@@ -1872,6 +1916,7 @@ local function open_diff_window(title, body, overview, opts)
     for _, f in ipairs(files) do
       f._raw_start = f.start_line
     end
+    file_tree = build_file_tree(files)
   end
 
   parse_body(body)
@@ -2116,31 +2161,49 @@ local function open_diff_window(title, body, overview, opts)
   pcall(vim.api.nvim_set_current_win, right_win)
 
   local function render_left(content_w)
+    rendered_rows = flatten_file_tree(file_tree, collapsed_dirs)
     local list_lines = {}
-    local hl_ranges = {}
-    for _, f in ipairs(files) do
-      local add_str = '+' .. f.add
-      local del_str = '-' .. f.del
-      local stats = add_str .. ' ' .. del_str
-      local path = f.path
-      local path_max = content_w - #stats - 1
-      if #path > path_max and path_max > 1 then
-        path = '…' .. path:sub(#path - path_max + 2)
+    local extmarks = {}
+    for _, row in ipairs(rendered_rows) do
+      local indent = string.rep('  ', row.depth)
+      if row.kind == 'dir' then
+        local arrow = collapsed_dirs[row.node.path] and '▸' or '▾'
+        local name = row.node.name .. '/'
+        local line = indent .. arrow .. ' ' .. name
+        if vim.fn.strdisplaywidth(line) > content_w then
+          line = line:sub(1, math.max(1, content_w - 1)) .. '…'
+        end
+        table.insert(list_lines, line)
+        local lidx = #list_lines - 1
+        local arrow_col = #indent
+        table.insert(extmarks, { line = lidx, col_start = arrow_col, col_end = arrow_col + #arrow, hl = 'DashboardAccentGithub' })
+        table.insert(extmarks, { line = lidx, col_start = arrow_col + #arrow + 1, col_end = #line, hl = '@string' })
+      else
+        local f = row.node.file
+        local add_str = '+' .. f.add
+        local del_str = '-' .. f.del
+        local stats = add_str .. ' ' .. del_str
+        local name = row.node.name
+        local prefix = indent .. '  '
+        local label = prefix .. name
+        local label_max = content_w - #stats - 1
+        if vim.fn.strdisplaywidth(label) > label_max and label_max > 1 then
+          local keep = label_max - #prefix - 1
+          if keep < 1 then keep = 1 end
+          label = prefix .. '…' .. name:sub(math.max(1, #name - keep + 2))
+        end
+        local gap = content_w - vim.fn.strdisplaywidth(label) - #stats
+        if gap < 1 then gap = 1 end
+        local line = label .. string.rep(' ', gap) .. stats
+        table.insert(list_lines, line)
+        local lidx = #list_lines - 1
+        local add_start = #label + gap
+        local add_end = add_start + #add_str
+        local del_start = add_end + 1
+        local del_end = del_start + #del_str
+        table.insert(extmarks, { line = lidx, col_start = add_start, col_end = add_end, hl = 'DashboardOk' })
+        table.insert(extmarks, { line = lidx, col_start = del_start, col_end = del_end, hl = 'DashboardError' })
       end
-      local gap = content_w - #path - #stats
-      if gap < 1 then
-        gap = 1
-      end
-      local line = path .. string.rep(' ', gap) .. stats
-      table.insert(list_lines, line)
-      local add_start = #path + gap
-      local add_end = add_start + #add_str
-      local del_start = add_end + 1
-      local del_end = del_start + #del_str
-      table.insert(
-        hl_ranges,
-        { line = #list_lines - 1, ranges = { { add_start, add_end, 'DashboardOk' }, { del_start, del_end, 'DashboardError' } } }
-      )
     end
     if #list_lines == 0 then
       list_lines = { '(no files in diff)' }
@@ -2149,10 +2212,8 @@ local function open_diff_window(title, body, overview, opts)
     vim.bo[left_buf].modifiable = true
     vim.api.nvim_buf_clear_namespace(left_buf, ns, 0, -1)
     vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, list_lines)
-    for _, h in ipairs(hl_ranges) do
-      for _, r in ipairs(h.ranges) do
-        vim.api.nvim_buf_set_extmark(left_buf, ns, h.line, r[1], { end_col = r[2], hl_group = r[3] })
-      end
+    for _, e in ipairs(extmarks) do
+      pcall(vim.api.nvim_buf_set_extmark, left_buf, ns, e.line, e.col_start, { end_col = e.col_end, hl_group = e.hl })
     end
     vim.bo[left_buf].modifiable = false
   end
@@ -2260,7 +2321,27 @@ local function open_diff_window(title, body, overview, opts)
       return
     end
     local lnum = vim.api.nvim_win_get_cursor(left_win)[1]
-    local f = files[lnum]
+    local row = rendered_rows[lnum]
+    if not row then
+      return
+    end
+    if row.kind == 'dir' then
+      if collapsed_dirs[row.node.path] then
+        collapsed_dirs[row.node.path] = nil
+      else
+        collapsed_dirs[row.node.path] = true
+      end
+      local target_path = row.node.path
+      render_left(geom.left_content_w)
+      for i, r in ipairs(rendered_rows) do
+        if r.node.path == target_path then
+          pcall(vim.api.nvim_win_set_cursor, left_win, { i, 0 })
+          break
+        end
+      end
+      return
+    end
+    local f = row.node.file
     if not f or not vim.api.nvim_win_is_valid(right_win) then
       return
     end
@@ -2279,8 +2360,6 @@ local function open_diff_window(title, body, overview, opts)
     local target_row = target_body + header_len
     vim.api.nvim_set_current_win(right_win)
     vim.api.nvim_win_set_cursor(right_win, { target_row, 0 })
-    -- Keep the file label virt_lines visible above by scrolling a few rows
-    -- past the file header instead of using zt (which would clip them).
     local topline = math.max(1, f.start_line - 1)
     pcall(vim.fn.winrestview, { topline = topline })
   end
@@ -4412,7 +4491,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   <CR>    open ticket details
 
 ## Diff / threads viewer
-  <CR>    jump to selected file's hunk + focus right pane (files pane)
+  <CR>    on file: jump to that file's first hunk; on dir: collapse/expand
   <Tab>   toggle focus (files ↔ content); re-opens files if hidden
   \       toggle the file explorer pane (full-screen the content)
   r       refresh (local diff viewer only)
