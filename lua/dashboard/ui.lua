@@ -416,6 +416,9 @@ local function emit_subhead(lines, title, count, pill_hl)
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
   table.insert(pending_subsections, idx)
+  if state.section_lines then
+    state.section_lines[title] = idx
+  end
 end
 
 local SPINNER_FRAMES = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
@@ -1288,6 +1291,7 @@ local function render()
   pending_line_bgs = {}
   pending_sections = {}
   pending_subsections = {}
+  state.section_lines = {}
   current_section_accent = nil
 
   sort_prs_by_repo(state.data.my_prs)
@@ -4354,6 +4358,10 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   r       refresh now
   q       close dashboard
   g?      this help
+  1       jump to "Awaiting my review"
+  2       jump to "Passed QA"
+  3       jump to "GitHub Inbox"
+  4       jump to "Jira recent"
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
   <leader>gd   local git diff (vs upstream) in the two-pane viewer
@@ -4437,6 +4445,22 @@ function M.show_help()
   vim.keymap.set('n', 'q', close, opts)
   vim.keymap.set('n', '<Esc>', close, opts)
   vim.keymap.set('n', 'g?', close, opts)
+end
+
+function M.jump_to_section(title)
+  if not buf_valid() or not state.win or not vim.api.nvim_win_is_valid(state.win) then
+    return
+  end
+  local idx = state.section_lines and state.section_lines[title]
+  if not idx then
+    vim.notify('Section not found: ' .. title, vim.log.levels.INFO)
+    return
+  end
+  local row = idx + 1
+  pcall(vim.api.nvim_win_set_cursor, state.win, { row, 0 })
+  vim.api.nvim_win_call(state.win, function()
+    vim.cmd 'normal! zt'
+  end)
 end
 
 function M.filter_prompt()
@@ -4586,6 +4610,18 @@ function M.open()
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 't', M.threads_under_cursor, opts)
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
+  vim.keymap.set('n', '1', function()
+    M.jump_to_section 'Awaiting my review'
+  end, opts)
+  vim.keymap.set('n', '2', function()
+    M.jump_to_section 'Passed QA'
+  end, opts)
+  vim.keymap.set('n', '3', function()
+    M.jump_to_section 'GitHub Inbox'
+  end, opts)
+  vim.keymap.set('n', '4', function()
+    M.jump_to_section 'Jira recent'
+  end, opts)
   vim.keymap.set('n', 'C', M.comments_under_cursor, opts)
   vim.keymap.set('n', 'x', function()
     local m = under_cursor()
