@@ -2264,7 +2264,56 @@ local function open_diff_window(title, body, overview, opts)
     end,
   })
 
+  local function current_file_path_in_right()
+    if not (right_win and vim.api.nvim_win_is_valid(right_win)) then
+      return nil
+    end
+    local buf_row = vim.api.nvim_win_get_cursor(right_win)[1] - 1
+    local computed_header_len = (files[1] and files[1].start_line and files[1]._raw_start)
+        and (files[1].start_line - files[1]._raw_start)
+      or 0
+    local body_row = buf_row + 1 - computed_header_len
+    if body_row < 1 or body_row > #body_lines then
+      return nil
+    end
+    return body_row_to_file[body_row]
+  end
+
+  local function expand_ancestors_of(path)
+    if not path then
+      return
+    end
+    local parts = vim.split(path, '/', { plain = true })
+    local acc = ''
+    for i = 1, #parts - 1 do
+      acc = acc == '' and parts[i] or (acc .. '/' .. parts[i])
+      collapsed_dirs[acc] = nil
+    end
+  end
+
+  local function sync_left_cursor_to_right()
+    if not (left_win and vim.api.nvim_win_is_valid(left_win)) then
+      return
+    end
+    local current_path = current_file_path_in_right()
+    if not current_path then
+      return
+    end
+    expand_ancestors_of(current_path)
+    render_left(geom.left_content_w)
+    for i, r in ipairs(rendered_rows) do
+      if r.kind == 'file' and r.node.file and r.node.file.path == current_path then
+        pcall(vim.api.nvim_win_set_cursor, left_win, { i, 0 })
+        break
+      end
+    end
+  end
+
   local function toggle_files()
+    local saved_right_cursor
+    if right_win and vim.api.nvim_win_is_valid(right_win) then
+      saved_right_cursor = vim.api.nvim_win_get_cursor(right_win)
+    end
     if left_win and vim.api.nvim_win_is_valid(left_win) then
       if vim.api.nvim_get_current_win() == left_win and vim.api.nvim_win_is_valid(right_win) then
         vim.api.nvim_set_current_win(right_win)
@@ -2287,6 +2336,12 @@ local function open_diff_window(title, body, overview, opts)
       left_win = vim.api.nvim_open_win(left_buf, false, left_win_config())
       apply_left_winopts()
       state.diff_left_win = left_win
+      sync_left_cursor_to_right()
+    end
+    if saved_right_cursor and right_win and vim.api.nvim_win_is_valid(right_win) then
+      local max_row = vim.api.nvim_buf_line_count(right_buf)
+      saved_right_cursor[1] = math.max(1, math.min(saved_right_cursor[1], max_row))
+      pcall(vim.api.nvim_win_set_cursor, right_win, saved_right_cursor)
     end
   end
 
@@ -2479,6 +2534,7 @@ local function open_diff_window(title, body, overview, opts)
         vim.api.nvim_set_current_win(left_win)
       end
     else
+      sync_left_cursor_to_right()
       vim.api.nvim_set_current_win(left_win)
     end
   end, right_opts)
