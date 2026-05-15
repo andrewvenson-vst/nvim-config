@@ -122,8 +122,74 @@ local config = {
   },
 }
 
+local function is_dashboard_window(w)
+  if not w then
+    return false
+  end
+  if state.win == w then
+    return true
+  end
+  if state.diff_left_win == w or state.diff_right_win == w then
+    return true
+  end
+  if state.viewer_wins then
+    for _, vw in ipairs(state.viewer_wins) do
+      if vw == w then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function setup_focus_handlers()
+  local group = vim.api.nvim_create_augroup('DashboardFocus', { clear = true })
+  vim.api.nvim_create_autocmd('WinEnter', {
+    group = group,
+    callback = function()
+      local w = vim.api.nvim_get_current_win()
+      if is_dashboard_window(w) then
+        state.last_dashboard_win = w
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd('FocusGained', {
+    group = group,
+    callback = function()
+      local w = state.last_dashboard_win
+      if w and vim.api.nvim_win_is_valid(w) and is_dashboard_window(w) then
+        pcall(vim.api.nvim_set_current_win, w)
+      end
+    end,
+  })
+end
+
+local function tmux_navigate(direction)
+  if not (vim.env.TMUX and vim.env.TMUX ~= '') then
+    return
+  end
+  vim.system({ 'tmux', 'select-pane', '-' .. direction }, {}, function() end)
+end
+
+local function apply_tmux_nav_keymaps(buf)
+  local kopts = { buffer = buf, nowait = true, silent = true }
+  vim.keymap.set('n', '<C-h>', function()
+    tmux_navigate 'L'
+  end, kopts)
+  vim.keymap.set('n', '<C-j>', function()
+    tmux_navigate 'D'
+  end, kopts)
+  vim.keymap.set('n', '<C-k>', function()
+    tmux_navigate 'U'
+  end, kopts)
+  vim.keymap.set('n', '<C-l>', function()
+    tmux_navigate 'R'
+  end, kopts)
+end
+
 function M.setup(opts)
   opts = opts or {}
+  setup_focus_handlers()
   if opts.repo_paths then
     config.repo_paths = opts.repo_paths
   end
@@ -2556,6 +2622,7 @@ local function open_diff_window(title, body, overview, opts)
   end
 
   local left_opts = { buffer = left_buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(left_buf)
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
   vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
@@ -2570,6 +2637,7 @@ local function open_diff_window(title, body, overview, opts)
   end, left_opts)
 
   local right_opts = { buffer = right_buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(right_buf)
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
   vim.keymap.set('n', '\\', toggle_files, right_opts)
@@ -3153,6 +3221,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
   end
 
   local left_opts = { buffer = left_buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(left_buf)
   vim.keymap.set('n', 'q', close, left_opts)
   vim.keymap.set('n', '<Esc>', close, left_opts)
   vim.keymap.set('n', '<CR>', jump_to_file, left_opts)
@@ -3164,6 +3233,7 @@ local function open_threads_window(title, threads, ctx_id, overview)
   end, left_opts)
 
   local right_opts = { buffer = right_buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(right_buf)
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
   vim.keymap.set('n', '\\', toggle_files, right_opts)
@@ -4341,6 +4411,7 @@ function open_result_window(title, on_reprompt, loading_text)
     refocus_dashboard(win)
   end
   local opts = { buffer = buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(buf)
   vim.keymap.set('n', 'q', close, opts)
   vim.keymap.set('n', '<Esc>', close, opts)
 
@@ -4826,6 +4897,7 @@ function M.open()
   end
 
   local opts = { buffer = state.buf, nowait = true, silent = true }
+  apply_tmux_nav_keymaps(state.buf)
   vim.keymap.set('n', 'q', M.close, opts)
   vim.keymap.set('n', '<Esc>', M.close, opts)
   vim.keymap.set('n', 'r', M.refresh, opts)
