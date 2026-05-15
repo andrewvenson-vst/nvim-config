@@ -1930,6 +1930,7 @@ local function open_diff_window(title, body, overview, opts)
   local file_tree
   local collapsed_dirs = {}
   local rendered_rows = {}
+  local update_diff_winbar
 
   local function parse_body(b)
     files = parse_diff(b)
@@ -2226,6 +2227,18 @@ local function open_diff_window(title, body, overview, opts)
   apply_left_winopts()
   pcall(vim.api.nvim_set_current_win, right_win)
 
+  vim.api.nvim_create_autocmd({ 'CursorMoved', 'WinScrolled', 'BufWinEnter' }, {
+    buffer = right_buf,
+    callback = function()
+      update_diff_winbar()
+    end,
+  })
+  vim.schedule(function()
+    if update_diff_winbar then
+      update_diff_winbar()
+    end
+  end)
+
   local function render_left(content_w)
     rendered_rows = flatten_file_tree(file_tree, collapsed_dirs)
     local list_lines = {}
@@ -2464,6 +2477,48 @@ local function open_diff_window(title, body, overview, opts)
       local topline = math.max(1, f.start_line - 1)
       pcall(vim.fn.winrestview, { topline = topline })
     end)
+  end
+
+  update_diff_winbar = function()
+    if not (right_win and vim.api.nvim_win_is_valid(right_win)) then
+      return
+    end
+    if not files or #files == 0 then
+      vim.wo[right_win].winbar = ''
+      return
+    end
+    local topline_1based = vim.api.nvim_win_call(right_win, function()
+      return vim.fn.line 'w0'
+    end)
+    local topline_0 = topline_1based - 1
+    local computed_header_len = (files[1] and files[1].start_line and files[1]._raw_start)
+        and (files[1].start_line - files[1]._raw_start)
+      or 0
+    local body_row = topline_0 + 1 - computed_header_len
+    if body_row < 1 then
+      vim.wo[right_win].winbar = ''
+      return
+    end
+    local cur
+    for _, f in ipairs(files) do
+      if f._raw_start <= body_row then
+        cur = f
+      else
+        break
+      end
+    end
+    if not cur then
+      vim.wo[right_win].winbar = ''
+      return
+    end
+    local path = (cur.path or '?'):gsub('%%', '%%%%')
+    vim.wo[right_win].winbar = ' %#Title# '
+      .. path
+      .. ' %#DashboardOk#+'
+      .. cur.add
+      .. ' %#DashboardError#-'
+      .. cur.del
+      .. ' %#Normal#'
   end
 
   local function file_idx_for_buf_row(buf_row)
