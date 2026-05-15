@@ -2291,12 +2291,8 @@ local function open_diff_window(title, body, overview, opts)
     end
   end
 
-  local function sync_left_cursor_to_right()
-    if not (left_win and vim.api.nvim_win_is_valid(left_win)) then
-      return
-    end
-    local current_path = current_file_path_in_right()
-    if not current_path then
+  local function sync_left_to_path(current_path)
+    if not (left_win and vim.api.nvim_win_is_valid(left_win)) or not current_path then
       return
     end
     expand_ancestors_of(current_path)
@@ -2307,6 +2303,10 @@ local function open_diff_window(title, body, overview, opts)
         break
       end
     end
+  end
+
+  local function sync_left_cursor_to_right()
+    sync_left_to_path(current_file_path_in_right())
   end
 
   local function toggle_files()
@@ -2326,6 +2326,7 @@ local function open_diff_window(title, body, overview, opts)
         render_right(geom.total_w - 2)
       end
     else
+      local current_path = current_file_path_in_right()
       if right_win and vim.api.nvim_win_is_valid(right_win) then
         vim.api.nvim_win_set_config(right_win, right_win_config_split())
         render_right(geom.right_content_w)
@@ -2336,7 +2337,8 @@ local function open_diff_window(title, body, overview, opts)
       left_win = vim.api.nvim_open_win(left_buf, false, left_win_config())
       apply_left_winopts()
       state.diff_left_win = left_win
-      sync_left_cursor_to_right()
+      sync_left_to_path(current_path)
+      pcall(vim.api.nvim_set_current_win, left_win)
     end
     if saved_right_cursor and right_win and vim.api.nvim_win_is_valid(right_win) then
       local max_row = vim.api.nvim_buf_line_count(right_buf)
@@ -2371,6 +2373,76 @@ local function open_diff_window(title, body, overview, opts)
     end,
   })
 
+  local function jump_right_to_file(f, focus)
+    if not f or not (right_win and vim.api.nvim_win_is_valid(right_win)) then
+      return
+    end
+    local header_len = f.start_line - f._raw_start
+    local target_body = f._raw_start
+    for j = f._raw_start + 1, #body_lines do
+      local l = body_lines[j]
+      if l:match '^diff %-%-git ' then
+        break
+      end
+      if l:match '^@@' then
+        target_body = j
+        break
+      end
+    end
+    local target_row = target_body + header_len
+    if focus then
+      vim.api.nvim_set_current_win(right_win)
+    end
+    vim.api.nvim_win_set_cursor(right_win, { target_row, 0 })
+    vim.api.nvim_win_call(right_win, function()
+      local topline = math.max(1, f.start_line - 1)
+      pcall(vim.fn.winrestview, { topline = topline })
+    end)
+  end
+
+  local function file_idx_for_buf_row(buf_row)
+    local computed_header_len = (files[1] and files[1].start_line and files[1]._raw_start)
+        and (files[1].start_line - files[1]._raw_start)
+      or 0
+    local body_row = buf_row + 1 - computed_header_len
+    if body_row < 1 then
+      return nil
+    end
+    local idx = nil
+    for i, f in ipairs(files) do
+      if f._raw_start <= body_row then
+        idx = i
+      else
+        break
+      end
+    end
+    return idx
+  end
+
+  local function next_file_in_right()
+    if not (right_win and vim.api.nvim_win_is_valid(right_win)) or #files == 0 then
+      return
+    end
+    local buf_row = vim.api.nvim_win_get_cursor(right_win)[1] - 1
+    local idx = file_idx_for_buf_row(buf_row) or 0
+    local target = math.min(idx + 1, #files)
+    if target ~= idx then
+      jump_right_to_file(files[target], false)
+    end
+  end
+
+  local function prev_file_in_right()
+    if not (right_win and vim.api.nvim_win_is_valid(right_win)) or #files == 0 then
+      return
+    end
+    local buf_row = vim.api.nvim_win_get_cursor(right_win)[1] - 1
+    local idx = file_idx_for_buf_row(buf_row) or (#files + 1)
+    local target = math.max(1, idx - 1)
+    if target ~= idx then
+      jump_right_to_file(files[target], false)
+    end
+  end
+
   local function jump_to_file()
     if not left_win or not vim.api.nvim_win_is_valid(left_win) then
       return
@@ -2396,27 +2468,7 @@ local function open_diff_window(title, body, overview, opts)
       end
       return
     end
-    local f = row.node.file
-    if not f or not vim.api.nvim_win_is_valid(right_win) then
-      return
-    end
-    local header_len = f.start_line - f._raw_start
-    local target_body = f._raw_start
-    for j = f._raw_start + 1, #body_lines do
-      local l = body_lines[j]
-      if l:match '^diff %-%-git ' then
-        break
-      end
-      if l:match '^@@' then
-        target_body = j
-        break
-      end
-    end
-    local target_row = target_body + header_len
-    vim.api.nvim_set_current_win(right_win)
-    vim.api.nvim_win_set_cursor(right_win, { target_row, 0 })
-    local topline = math.max(1, f.start_line - 1)
-    pcall(vim.fn.winrestview, { topline = topline })
+    jump_right_to_file(row.node.file, true)
   end
 
   local refreshing = false
@@ -2521,6 +2573,8 @@ local function open_diff_window(title, body, overview, opts)
   vim.keymap.set('n', 'q', close, right_opts)
   vim.keymap.set('n', '<Esc>', close, right_opts)
   vim.keymap.set('n', '\\', toggle_files, right_opts)
+  vim.keymap.set('n', '}', next_file_in_right, right_opts)
+  vim.keymap.set('n', '{', prev_file_in_right, right_opts)
   if opts.refresh_fn then
     vim.keymap.set('n', 'r', refresh, right_opts)
   end
@@ -4549,6 +4603,8 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
 ## Diff / threads viewer
   <CR>    on file: jump to that file's first hunk; on dir: collapse/expand
   <Tab>   toggle focus (files ↔ content); re-opens files if hidden
+  }       next file in the diff (right pane)
+  {       previous file in the diff (right pane)
   \       toggle the file explorer pane (full-screen the content)
   r       refresh (local diff viewer only)
   q       close both panes
