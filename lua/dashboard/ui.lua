@@ -1004,18 +1004,33 @@ local function badge_segments(label, count)
 end
 
 local function emit_header(lines)
-  emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
+  local title_text = '  ★  Status Dashboard'
   local gh_count = count_unread_notifications()
   local jira_count = count_jira_recent()
-  local badge_row = { { text = '  ', hl = nil } }
-  for _, s in ipairs(badge_segments('GH', gh_count)) do
-    table.insert(badge_row, s)
+  local gh_segs = badge_segments('GH', gh_count)
+  local jira_segs = badge_segments('Jira', jira_count)
+  local badges_w = 3 -- spacer between the two pills
+  for _, s in ipairs(gh_segs) do
+    badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
   end
-  table.insert(badge_row, { text = '   ', hl = nil })
-  for _, s in ipairs(badge_segments('Jira', jira_count)) do
-    table.insert(badge_row, s)
+  for _, s in ipairs(jira_segs) do
+    badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
   end
-  emit_segments(lines, badge_row)
+  local title_w = vim.fn.strdisplaywidth(title_text)
+  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
+  local filler_w = math.max(1, win_w - title_w - badges_w - 2)
+  local row = {
+    { text = title_text, hl = 'Title' },
+    { text = string.rep(' ', filler_w), hl = nil },
+  }
+  for _, s in ipairs(gh_segs) do
+    table.insert(row, s)
+  end
+  table.insert(row, { text = '   ', hl = nil })
+  for _, s in ipairs(jira_segs) do
+    table.insert(row, s)
+  end
+  emit_segments(lines, row)
   emit_segments(lines, {
     { text = '  ', hl = nil },
     { text = 'g?', hl = '@keyword' },
