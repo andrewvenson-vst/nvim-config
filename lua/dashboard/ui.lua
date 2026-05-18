@@ -2998,40 +2998,39 @@ local function open_diff_window(title, body, overview, opts)
       vim.notify('Review submission only works on PR diffs', vim.log.levels.INFO)
       return
     end
-    local choices = { 'Approve', 'Request changes', 'Comment' }
-    local event_map = { ['Approve'] = 'APPROVE', ['Request changes'] = 'REQUEST_CHANGES', ['Comment'] = 'COMMENT' }
-    vim.ui.select(choices, { prompt = 'Submit review:' }, function(choice)
-      if not choice then
-        return
-      end
-      local event = event_map[choice]
-      vim.ui.input({ prompt = 'Review body (optional): ' }, function(body)
-        body = body or ''
-        local args = {
-          'gh',
-          'api',
-          '-X',
-          'POST',
-          '-H',
-          'Accept: application/vnd.github+json',
-          '/repos/' .. overview.repo .. '/pulls/' .. tostring(overview.number) .. '/reviews',
-          '-f',
-          'event=' .. event,
-        }
-        if body ~= '' then
-          table.insert(args, '-f')
-          table.insert(args, 'body=' .. body)
+    local choice = vim.fn.confirm('Submit review:', '&Approve\n&Request changes\n&Comment\nCa&ncel', 4, 'Question')
+    if choice == 0 or choice == 4 then
+      return
+    end
+    local events = { 'APPROVE', 'REQUEST_CHANGES', 'COMMENT' }
+    local event = events[choice]
+    if not event then
+      return
+    end
+    local body = vim.fn.input { prompt = 'Review body (optional): ' }
+    local args = {
+      'gh',
+      'api',
+      '-X',
+      'POST',
+      '-H',
+      'Accept: application/vnd.github+json',
+      '/repos/' .. overview.repo .. '/pulls/' .. tostring(overview.number) .. '/reviews',
+      '-f',
+      'event=' .. event,
+    }
+    if body and body ~= '' then
+      table.insert(args, '-f')
+      table.insert(args, 'body=' .. body)
+    end
+    vim.notify('Submitting ' .. event .. '…', vim.log.levels.INFO)
+    vim.system(args, { text = true }, function(obj)
+      vim.schedule(function()
+        if obj.code == 0 then
+          vim.notify('Review submitted: ' .. event, vim.log.levels.INFO)
+        else
+          vim.notify('Failed to submit review: ' .. parse_post_error(obj), vim.log.levels.ERROR)
         end
-        vim.notify('Submitting ' .. event .. '…', vim.log.levels.INFO)
-        vim.system(args, { text = true }, function(obj)
-          vim.schedule(function()
-            if obj.code == 0 then
-              vim.notify('Review submitted: ' .. event, vim.log.levels.INFO)
-            else
-              vim.notify('Failed to submit review: ' .. parse_post_error(obj), vim.log.levels.ERROR)
-            end
-          end)
-        end)
       end)
     end)
   end
