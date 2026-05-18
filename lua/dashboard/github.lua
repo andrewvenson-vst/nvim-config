@@ -113,8 +113,12 @@ query($owner: String!, $repo: String!, $number: Int!) {
           path
           line
           originalLine
+          startLine
+          originalStartLine
+          diffSide
           comments(first: 50) {
             nodes {
+              databaseId
               author { login }
               createdAt
               body
@@ -302,7 +306,7 @@ function M.fetch_pr_overview(repo, number, callback)
     '--repo',
     repo,
     '--json',
-    'number,title,body,author,state,baseRefName,headRefName,labels',
+    'number,title,body,author,state,baseRefName,headRefName,headRefOid,labels',
   }, { text = true }, function(obj)
     vim.schedule(function()
       if obj.code ~= 0 then
@@ -326,6 +330,7 @@ function M.fetch_pr_overview(repo, number, callback)
         state = parsed.state,
         base = parsed.baseRefName,
         head = parsed.headRefName,
+        head_sha = parsed.headRefOid,
         labels = labels,
       }
     end)
