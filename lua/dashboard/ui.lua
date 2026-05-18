@@ -1678,14 +1678,6 @@ function M.interactive_claude_under_cursor()
         return
       end
       tmux_run({ 'claude' }, repo_path)
-      M.close()
-      vim.cmd('tcd ' .. vim.fn.fnameescape(repo_path))
-      local readme = repo_path .. '/README.md'
-      if vim.fn.filereadable(readme) == 1 then
-        vim.cmd('edit ' .. vim.fn.fnameescape(readme))
-      else
-        vim.cmd('edit ' .. vim.fn.fnameescape(repo_path))
-      end
     end)
   end)
 end
@@ -3001,6 +2993,49 @@ local function open_diff_window(title, body, overview, opts)
     end)
   end
 
+  local function submit_review()
+    if not (overview and overview.repo and overview.number) then
+      vim.notify('Review submission only works on PR diffs', vim.log.levels.INFO)
+      return
+    end
+    local choices = { 'Approve', 'Request changes', 'Comment' }
+    local event_map = { ['Approve'] = 'APPROVE', ['Request changes'] = 'REQUEST_CHANGES', ['Comment'] = 'COMMENT' }
+    vim.ui.select(choices, { prompt = 'Submit review:' }, function(choice)
+      if not choice then
+        return
+      end
+      local event = event_map[choice]
+      vim.ui.input({ prompt = 'Review body (optional): ' }, function(body)
+        body = body or ''
+        local args = {
+          'gh',
+          'api',
+          '-X',
+          'POST',
+          '-H',
+          'Accept: application/vnd.github+json',
+          '/repos/' .. overview.repo .. '/pulls/' .. tostring(overview.number) .. '/reviews',
+          '-f',
+          'event=' .. event,
+        }
+        if body ~= '' then
+          table.insert(args, '-f')
+          table.insert(args, 'body=' .. body)
+        end
+        vim.notify('Submitting ' .. event .. '…', vim.log.levels.INFO)
+        vim.system(args, { text = true }, function(obj)
+          vim.schedule(function()
+            if obj.code == 0 then
+              vim.notify('Review submitted: ' .. event, vim.log.levels.INFO)
+            else
+              vim.notify('Failed to submit review: ' .. parse_post_error(obj), vim.log.levels.ERROR)
+            end
+          end)
+        end)
+      end)
+    end)
+  end
+
   local right_opts = { buffer = right_buf, nowait = true, silent = true }
   apply_tmux_nav_keymaps(right_buf)
   vim.keymap.set('n', 'q', close, right_opts)
@@ -3015,6 +3050,7 @@ local function open_diff_window(title, body, overview, opts)
     vim.keymap.set('x', 'c', function()
       comment_on_lines 'visual'
     end, right_opts)
+    vim.keymap.set('n', 'R', submit_review, right_opts)
   end
   if opts.refresh_fn then
     vim.keymap.set('n', 'r', refresh, right_opts)
@@ -4569,6 +4605,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   }       next file in the diff (right pane)
   {       previous file in the diff (right pane)
   c       (PR diff) comment on line under cursor; visual: range; on a thread: reply
+  R       (PR diff) submit review: approve / request changes / comment
   \       toggle the file explorer pane (full-screen the content)
   r       refresh (local diff viewer only)
   q       close both panes
