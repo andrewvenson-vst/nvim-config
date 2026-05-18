@@ -297,6 +297,73 @@ function M.fetch_actions(repo, callback)
   end)
 end
 
+local function reconstruct_diff_from_files(files)
+  local out = {}
+  for _, f in ipairs(files or {}) do
+    if f.patch and f.patch ~= '' then
+      local new_path = f.filename or '?'
+      local old_path
+      if f.status == 'added' then
+        old_path = '/dev/null'
+      elseif f.status == 'renamed' then
+        old_path = 'a/' .. (f.previous_filename or new_path)
+      else
+        old_path = 'a/' .. new_path
+      end
+      local new_marker = (f.status == 'removed') and '/dev/null' or ('b/' .. new_path)
+      local header = 'diff --git a/'
+        .. (f.previous_filename or new_path)
+        .. ' b/'
+        .. new_path
+        .. '\n--- '
+        .. old_path
+        .. '\n+++ '
+        .. new_marker
+        .. '\n'
+      table.insert(out, header .. f.patch)
+    end
+  end
+  return table.concat(out, '\n')
+end
+
+function M.fetch_pr_diff(repo, number, url, callback)
+  vim.system({ 'gh', 'pr', 'diff', url }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code == 0 then
+        callback(obj.stdout)
+        return
+      end
+      local stderr = obj.stderr or ''
+      local too_large = stderr:find('too_large')
+        or stderr:find('exceeded the maximum number of files')
+        or stderr:find('HTTP 406')
+      if not too_large then
+        callback(nil, stderr ~= '' and stderr or ('gh exit ' .. obj.code))
+        return
+      end
+      vim.system({
+        'gh',
+        'api',
+        '--paginate',
+        '/repos/' .. repo .. '/pulls/' .. tostring(number) .. '/files',
+      }, { text = true }, function(fobj)
+        vim.schedule(function()
+          if fobj.code ~= 0 then
+            callback(nil, (fobj.stderr ~= '' and fobj.stderr) or ('gh exit ' .. fobj.code))
+            return
+          end
+          local ok, parsed = pcall(vim.json.decode, fobj.stdout, { luanil = { object = true, array = true } })
+          if not ok or type(parsed) ~= 'table' then
+            callback(nil, 'json parse error reading /pulls/N/files')
+            return
+          end
+          callback(reconstruct_diff_from_files(parsed))
+        end)
+      end)
+    end)
+  end)
+end
+
 function M.fetch_pr_overview(repo, number, callback)
   vim.system({
     'gh',

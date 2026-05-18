@@ -3820,9 +3820,34 @@ function M.actions_under_cursor()
   end)
 end
 
--- Fetch local diff (vs upstream, fallback HEAD) including untracked files.
--- Callback receives (diff_text, err, label). diff_text is '' for no changes.
-local function fetch_local_diff(callback)
+-- Detect a base branch to diff against. Tries common base branches in order.
+local function detect_base_branch(cwd, callback)
+  local candidates = { 'origin/develop', 'develop', 'origin/main', 'main', 'origin/master', 'master' }
+  local idx = 1
+  local function try_next()
+    if idx > #candidates then
+      callback(nil)
+      return
+    end
+    local c = candidates[idx]
+    idx = idx + 1
+    vim.system({ 'git', '-C', cwd, 'rev-parse', '--verify', '--quiet', c }, { text = true }, function(obj)
+      vim.schedule(function()
+        if obj.code == 0 then
+          callback(c)
+        else
+          try_next()
+        end
+      end)
+    end)
+  end
+  try_next()
+end
+
+-- Fetch local diff (vs detected base branch, or user-supplied target) including
+-- untracked files. Callback receives (diff_text, err, label). diff_text is ''
+-- for no changes. target_override, if provided, skips base detection.
+local function fetch_local_diff(callback, target_override)
   local cwd = vim.fn.getcwd()
   vim.system({ 'git', '-C', cwd, 'rev-parse', '--is-inside-work-tree' }, { text = true }, function(check)
     vim.schedule(function()
@@ -3830,99 +3855,120 @@ local function fetch_local_diff(callback)
         callback(nil, 'Not inside a git repository', nil)
         return
       end
-      vim.system(
-        { 'git', '-C', cwd, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}' },
-        { text = true },
-        function(up)
+      local function with_target(target, label)
+        local results = { tracked = nil, untracked = nil }
+        local pending = 2
+        local function done_inner()
+          pending = pending - 1
+          if pending > 0 then
+            return
+          end
+          local diff = (results.tracked or '') .. (results.untracked or '')
+          callback(diff, nil, label)
+        end
+        vim.system({ 'git', '-C', cwd, 'merge-base', target, 'HEAD' }, { text = true }, function(mb)
           vim.schedule(function()
-            local target, label
-            if up.code == 0 then
-              target = vim.trim(up.stdout or '')
-              label = target
-            else
-              target = 'HEAD'
-              label = 'HEAD'
-            end
-            local results = { tracked = nil, untracked = nil }
-            local pending = 2
-            local function done()
-              pending = pending - 1
-              if pending > 0 then
-                return
-              end
-              local diff = (results.tracked or '') .. (results.untracked or '')
-              callback(diff, nil, label)
-            end
-
-            vim.system({ 'git', '-C', cwd, 'diff', target }, { text = true }, function(obj)
+            local diff_target = (mb.code == 0 and mb.stdout and mb.stdout ~= '')
+                and vim.trim(mb.stdout)
+              or target
+            vim.system({ 'git', '-C', cwd, 'diff', diff_target }, { text = true }, function(obj)
               vim.schedule(function()
                 if obj.code ~= 0 then
                   results.tracked = ''
                 else
                   results.tracked = obj.stdout or ''
                 end
-                done()
+                done_inner()
               end)
             end)
-
-            vim.system(
-              { 'git', '-C', cwd, 'ls-files', '--others', '--exclude-standard' },
-              { text = true },
-              function(ls)
-                vim.schedule(function()
-                  if ls.code ~= 0 then
-                    results.untracked = ''
-                    done()
-                    return
-                  end
-                  local files = {}
-                  for f in (ls.stdout or ''):gmatch '[^\n]+' do
-                    table.insert(files, f)
-                  end
-                  if #files == 0 then
-                    results.untracked = ''
-                    done()
-                    return
-                  end
-                  local remaining = #files
-                  local chunks = {}
-                  for i, file in ipairs(files) do
-                    vim.system(
-                      { 'git', '-C', cwd, 'diff', '--no-index', '--', '/dev/null', file },
-                      { text = true },
-                      function(d)
-                        vim.schedule(function()
-                          if (d.code == 0 or d.code == 1) and d.stdout and d.stdout ~= '' then
-                            chunks[i] = d.stdout
-                          else
-                            chunks[i] = ''
-                          end
-                          remaining = remaining - 1
-                          if remaining == 0 then
-                            local parts = {}
-                            for j = 1, #files do
-                              if chunks[j] and chunks[j] ~= '' then
-                                table.insert(parts, chunks[j])
-                              end
-                            end
-                            results.untracked = table.concat(parts, '\n')
-                            done()
-                          end
-                        end)
-                      end
-                    )
-                  end
-                end)
-              end
-            )
           end)
+        end)
+        vim.system(
+          { 'git', '-C', cwd, 'ls-files', '--others', '--exclude-standard' },
+          { text = true },
+          function(ls)
+            vim.schedule(function()
+              if ls.code ~= 0 then
+                results.untracked = ''
+                done_inner()
+                return
+              end
+              local files = {}
+              for f in (ls.stdout or ''):gmatch '[^\n]+' do
+                table.insert(files, f)
+              end
+              if #files == 0 then
+                results.untracked = ''
+                done_inner()
+                return
+              end
+              local remaining = #files
+              local chunks = {}
+              for i, file in ipairs(files) do
+                vim.system(
+                  { 'git', '-C', cwd, 'diff', '--no-index', '--', '/dev/null', file },
+                  { text = true },
+                  function(d)
+                    vim.schedule(function()
+                      if (d.code == 0 or d.code == 1) and d.stdout and d.stdout ~= '' then
+                        chunks[i] = d.stdout
+                      else
+                        chunks[i] = ''
+                      end
+                      remaining = remaining - 1
+                      if remaining == 0 then
+                        local parts = {}
+                        for j = 1, #files do
+                          if chunks[j] and chunks[j] ~= '' then
+                            table.insert(parts, chunks[j])
+                          end
+                        end
+                        results.untracked = table.concat(parts, '\n')
+                        done_inner()
+                      end
+                    end)
+                  end
+                )
+              end
+            end)
+          end
+        )
+      end
+
+      if target_override and target_override ~= '' then
+        with_target(target_override, target_override)
+        return
+      end
+
+      detect_base_branch(cwd, function(base)
+        if base then
+          with_target(base, base)
+        else
+          vim.system(
+            { 'git', '-C', cwd, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}' },
+            { text = true },
+            function(up)
+              vim.schedule(function()
+                local target, label
+                if up.code == 0 then
+                  target = vim.trim(up.stdout or '')
+                  label = target
+                else
+                  target = 'HEAD'
+                  label = 'HEAD'
+                end
+                with_target(target, label)
+              end)
+            end
+          )
         end
-      )
+      end)
     end)
   end)
 end
 
-function M.show_local_diff()
+
+local function open_local_diff(target_override)
   if diff_viewer_open() then
     focus_diff_viewer()
     return
@@ -3947,13 +3993,95 @@ function M.show_local_diff()
       refresh_fn = function(cb)
         fetch_local_diff(function(new_diff, new_err)
           cb(new_diff, new_err)
-        end)
+        end, target_override)
       end,
       initial_cursor = state.local_diff_cursor,
       on_close = function(cur)
         state.local_diff_cursor = cur
       end,
     })
+  end, target_override)
+end
+
+function M.show_local_diff()
+  open_local_diff(nil)
+end
+
+local function list_branches(callback)
+  local cwd = vim.fn.getcwd()
+  vim.system({
+    'git',
+    '-C',
+    cwd,
+    'for-each-ref',
+    '--format=%(refname:short)',
+    'refs/heads',
+    'refs/remotes',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback({})
+        return
+      end
+      local branches = {}
+      local seen = {}
+      for line in (obj.stdout or ''):gmatch '[^\n]+' do
+        local b = vim.trim(line)
+        if b ~= '' and not b:match '/HEAD$' and not seen[b] then
+          seen[b] = true
+          table.insert(branches, b)
+        end
+      end
+      callback(branches)
+    end)
+  end)
+end
+
+local function pick_branch(callback)
+  list_branches(function(branches)
+    if #branches == 0 then
+      vim.notify('No branches found', vim.log.levels.WARN)
+      return
+    end
+    local ok, pickers = pcall(require, 'telescope.pickers')
+    if ok then
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      pickers
+        .new({}, {
+          prompt_title = 'Diff vs branch/commit',
+          finder = finders.new_table { results = branches },
+          sorter = conf.generic_sorter {},
+          attach_mappings = function(prompt_bufnr)
+            actions.select_default:replace(function()
+              local entry = action_state.get_selected_entry()
+              actions.close(prompt_bufnr)
+              if entry then
+                local val = entry.value or entry[1]
+                if val and val ~= '' then
+                  callback(val)
+                end
+              end
+            end)
+            return true
+          end,
+        })
+        :find()
+    else
+      vim.ui.select(branches, { prompt = 'Diff vs branch/commit' }, function(choice)
+        if choice and choice ~= '' then
+          callback(choice)
+        end
+      end)
+    end
+  end)
+end
+
+function M.show_local_diff_with_prompt()
+  pick_branch(function(target)
+    open_local_diff(target)
   end)
 end
 
@@ -3980,16 +4108,14 @@ function M.diff_under_cursor()
     open_diff_window(title, results.diff, results.overview, { threads = results.threads })
   end
 
-  vim.system({ 'gh', 'pr', 'diff', m.url }, { text = true }, function(obj)
-    vim.schedule(function()
-      if obj.code ~= 0 then
-        errored = true
-        vim.notify('Failed to fetch diff: ' .. (obj.stderr or ''), vim.log.levels.ERROR)
-        return
-      end
-      results.diff = obj.stdout
-      done()
-    end)
+  require('dashboard.github').fetch_pr_diff(m.pr.repo, m.pr.number, m.url, function(diff, err)
+    if not diff then
+      errored = true
+      vim.notify('Failed to fetch diff: ' .. (err or ''), vim.log.levels.ERROR)
+      return
+    end
+    results.diff = diff
+    done()
   end)
   require('dashboard.github').fetch_review_threads(m.pr.repo, m.pr.number, function(threads)
     results.threads = threads or {}
@@ -4318,7 +4444,8 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   4       jump to "Jira recent"
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
-  <leader>gd   local git diff (vs upstream) in the two-pane viewer
+  <leader>gd   local git diff (vs detected base: develop → main → master)
+  <leader>gD   local git diff vs custom branch/commit (prompts)
 
 ## Notes section
   n       new note (auto-prepends "- ")

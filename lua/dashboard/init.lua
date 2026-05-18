@@ -25,7 +25,11 @@ function M.setup(opts)
 
   vim.keymap.set('n', '<leader>gd', function()
     require('dashboard.ui').show_local_diff()
-  end, { desc = '[G]it local [D]iff (vs upstream)' })
+  end, { desc = '[G]it local [D]iff (vs base branch)' })
+
+  vim.keymap.set('n', '<leader>gD', function()
+    require('dashboard.ui').show_local_diff_with_prompt()
+  end, { desc = '[G]it local [D]iff vs custom branch/commit' })
 end
 
 return M
