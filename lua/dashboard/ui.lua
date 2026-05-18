@@ -4079,9 +4079,101 @@ local function pick_branch(callback)
   end)
 end
 
+local function list_commits(callback)
+  local cwd = vim.fn.getcwd()
+  vim.system({
+    'git',
+    '-C',
+    cwd,
+    'log',
+    '-n',
+    '50',
+    '--date=format:%Y-%m-%d %H:%M',
+    '--pretty=format:%h\31%cd\31%cr\31%s\31%an',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback({})
+        return
+      end
+      local commits = {}
+      for line in (obj.stdout or ''):gmatch '[^\n]+' do
+        local sha, date, age, subject, author = line:match '^([^\31]+)\31([^\31]*)\31([^\31]*)\31([^\31]*)\31(.*)$'
+        if sha then
+          table.insert(commits, { sha = sha, date = date, age = age, subject = subject, author = author })
+        end
+      end
+      callback(commits)
+    end)
+  end)
+end
+
+local function pick_commit(callback)
+  list_commits(function(commits)
+    if #commits == 0 then
+      vim.notify('No commits found', vim.log.levels.WARN)
+      return
+    end
+    local function fmt(c)
+      return string.format('%s  %s  %s  · %s', c.sha, c.date, c.subject, c.age)
+    end
+    local ok, pickers = pcall(require, 'telescope.pickers')
+    if ok then
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      pickers
+        .new({}, {
+          prompt_title = 'Diff vs commit',
+          finder = finders.new_table {
+            results = commits,
+            entry_maker = function(c)
+              return {
+                value = c.sha,
+                display = fmt(c),
+                ordinal = c.sha .. ' ' .. c.subject .. ' ' .. c.author,
+              }
+            end,
+          },
+          sorter = conf.generic_sorter {},
+          attach_mappings = function(prompt_bufnr)
+            actions.select_default:replace(function()
+              local entry = action_state.get_selected_entry()
+              actions.close(prompt_bufnr)
+              if entry and entry.value then
+                callback(entry.value)
+              end
+            end)
+            return true
+          end,
+        })
+        :find()
+    else
+      local items = {}
+      for _, c in ipairs(commits) do
+        table.insert(items, fmt(c))
+      end
+      vim.ui.select(items, { prompt = 'Diff vs commit' }, function(_, idx)
+        if idx and commits[idx] then
+          callback(commits[idx].sha)
+        end
+      end)
+    end
+  end)
+end
+
 function M.show_local_diff_with_prompt()
-  pick_branch(function(target)
-    open_local_diff(target)
+  vim.ui.select({ 'Branch', 'Commit' }, { prompt = 'Diff vs:' }, function(choice)
+    if choice == 'Branch' then
+      pick_branch(function(target)
+        open_local_diff(target)
+      end)
+    elseif choice == 'Commit' then
+      pick_commit(function(target)
+        open_local_diff(target)
+      end)
+    end
   end)
 end
 
