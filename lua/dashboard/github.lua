@@ -14,7 +14,7 @@ query {
         repository { nameWithOwner }
         reviewDecision
         latestReviews(first: 20) { nodes { state } }
-        reviewThreads(first: 100) { totalCount nodes { isResolved } }
+        reviewThreads(first: 50) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -30,7 +30,23 @@ query {
         repository { nameWithOwner }
         reviewDecision
         latestReviews(first: 20) { nodes { state } }
-        reviewThreads(first: 100) { totalCount nodes { isResolved } }
+        reviewThreads(first: 50) { totalCount nodes { isResolved } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+  tagged: search(query: "is:pr is:open archived:false involves:@me -author:@me -org:VirdocsSoftware sort:updated-desc", type: ISSUE, first: 30) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        body
+        updatedAt
+        repository { nameWithOwner }
+        reviewDecision
+        latestReviews(first: 20) { nodes { state } }
+        reviewThreads(first: 50) { totalCount nodes { isResolved } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
@@ -97,6 +113,7 @@ function M.fetch_prs(callback)
       callback {
         my_prs = flatten(data.mine and data.mine.nodes),
         reviews = flatten(data.reviews and data.reviews.nodes),
+        tagged = flatten(data.tagged and data.tagged.nodes),
       }
     end)
   end)
@@ -360,6 +377,39 @@ function M.fetch_pr_diff(repo, number, url, callback)
           callback(reconstruct_diff_from_files(parsed))
         end)
       end)
+    end)
+  end)
+end
+
+function M.fetch_issue_comments(repo, number, callback)
+  vim.system({
+    'gh',
+    'api',
+    '--paginate',
+    '-H',
+    'Accept: application/vnd.github+json',
+    '/repos/' .. repo .. '/issues/' .. tostring(number) .. '/comments',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('gh exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' then
+        callback(nil, 'json parse error')
+        return
+      end
+      local out = {}
+      for _, c in ipairs(parsed) do
+        table.insert(out, {
+          author = c.user and c.user.login or '?',
+          body = c.body or '',
+          created_at = c.created_at,
+          updated_at = c.updated_at,
+        })
+      end
+      callback(out)
     end)
   end)
 end

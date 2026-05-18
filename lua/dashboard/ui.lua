@@ -321,6 +321,16 @@ local function clear_loading()
   vim.api.nvim_echo({}, false, {})
 end
 
+local LEGEND_ITEMS = {
+  { key = '1', label = 'Notes', target = 'Notes' },
+  { key = '2', label = 'My PRs', target = 'My PRs' },
+  { key = '3', label = 'Review', target = 'Awaiting my review' },
+  { key = '4', label = 'Tagged in', target = 'Tagged in' },
+  { key = '5', label = 'Notifications', target = 'Notifications' },
+  { key = '6', label = 'Jira', target = 'Jira' },
+  { key = '7', label = 'Passed QA', target = 'Passed QA' },
+}
+
 local function hide_dashboard()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     if state.win == vim.api.nvim_get_current_win() then
@@ -467,6 +477,9 @@ local function emit_divider(lines, label)
   paint(idx, cols)
   table.insert(pending_line_bgs, { line = idx, hl = 'DashboardSectionBg' })
   table.insert(pending_sections, idx)
+  if state.section_lines then
+    state.section_lines[label] = idx
+  end
 end
 
 local function emit_subhead(lines, title, count, pill_hl)
@@ -621,6 +634,7 @@ local function all_known_prs()
   end
   ingest(state.data.my_prs)
   ingest(state.data.reviews)
+  ingest(state.data.tagged)
   return out
 end
 
@@ -1119,8 +1133,6 @@ end
 local function emit_header(lines)
   local title_text = '  ★  Status Dashboard'
   local badges = {
-    { 'Review', count_reviews() },
-    { 'Passed QA', count_passed_qa() },
     { 'GH', count_unread_notifications() },
     { 'Jira', count_jira_recent() },
   }
@@ -1384,6 +1396,7 @@ local function render()
 
   sort_prs_by_repo(state.data.my_prs)
   sort_prs_by_repo(state.data.reviews)
+  sort_prs_by_repo(state.data.tagged)
   local pr_pool = all_known_prs()
 
   local f = state.filter
@@ -1399,6 +1412,9 @@ local function render()
   local reviews = maybe_filter(state.data.reviews, function(p)
     return pr_matches(p, f)
   end)
+  local tagged = maybe_filter(state.data.tagged, function(p)
+    return pr_matches(p, f)
+  end)
   local notifications = maybe_filter(state.data.notifications, function(n)
     return notification_matches(n, f)
   end)
@@ -1412,6 +1428,7 @@ local function render()
   emit_blank(lines)
   emit_pr_section(lines, meta, 'My PRs', my_prs, 'No open PRs', { draft = true })
   emit_pr_section(lines, meta, 'Awaiting my review', reviews, 'Inbox zero', {})
+  emit_pr_section(lines, meta, 'Tagged in', tagged, 'Nothing tagged', {})
 
   emit_divider(lines, 'Notifications')
   emit_blank(lines)
@@ -3157,6 +3174,34 @@ function emit_pr_header_card(content_w, overview, push_raw, push_bg, push_seg)
     end
   end
   push_bg('', hbg)
+
+  local comments = overview.issue_comments or {}
+  if #comments > 0 then
+    push_seg({
+      { text = indent, hl = nil },
+      { text = 'DISCUSSION (' .. tostring(#comments) .. ')', hl = 'Title' },
+    }, hbg)
+    push_seg({
+      { text = indent, hl = nil },
+      { text = string.rep('╌', dash_w), hl = 'NonText' },
+    }, hbg)
+    local body_max = math.max(20, content_w - 4)
+    for i, c in ipairs(comments) do
+      local age = relative_time(c.created_at)
+      push_seg({
+        { text = indent, hl = nil },
+        { text = '💬 ' .. (c.author or '?'), hl = 'Title' },
+        { text = '  ' .. (age or ''), hl = 'Comment' },
+      }, hbg)
+      for _, l in ipairs(wrap_text(c.body or '', body_max)) do
+        push_bg(indent .. l, hbg)
+      end
+      if i < #comments then
+        push_bg('', hbg)
+      end
+    end
+    push_bg('', hbg)
+  end
 end
 
 local function ago(iso)
@@ -4223,13 +4268,16 @@ function M.diff_under_cursor()
   end
   show_loading('Loading diff…')
 
-  local results = { diff = nil, overview = nil, threads = nil }
-  local pending = 3
+  local results = { diff = nil, overview = nil, threads = nil, issue_comments = nil }
+  local pending = 4
   local errored = false
   local function done()
     pending = pending - 1
     if pending > 0 or errored then
       return
+    end
+    if results.overview then
+      results.overview.issue_comments = results.issue_comments or {}
     end
     local title = string.format('%s#%d', m.pr.repo, m.pr.number)
     open_diff_window(title, results.diff, results.overview, { threads = results.threads })
@@ -4246,6 +4294,10 @@ function M.diff_under_cursor()
   end)
   require('dashboard.github').fetch_review_threads(m.pr.repo, m.pr.number, function(threads)
     results.threads = threads or {}
+    done()
+  end)
+  require('dashboard.github').fetch_issue_comments(m.pr.repo, m.pr.number, function(comments)
+    results.issue_comments = comments or {}
     done()
   end)
   require('dashboard.github').fetch_pr_overview(m.pr.repo, m.pr.number, function(overview)
@@ -4565,10 +4617,14 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   r       refresh now
   q       close dashboard
   g?      this help
-  1       jump to "Awaiting my review"
-  2       jump to "Passed QA"
-  3       jump to "GitHub Inbox"
-  4       jump to "Jira recent"
+  J       open the centered jump picker (one key to pick a section)
+  1       jump to Notes
+  2       jump to My PRs
+  3       jump to Awaiting my review
+  4       jump to Tagged in
+  5       jump to Notifications section
+  6       jump to Jira section
+  7       jump to Passed QA
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
   <leader>gd   local git diff (vs detected base: develop → main → master)
@@ -4658,6 +4714,79 @@ function M.show_help()
   vim.keymap.set('n', 'g?', close, opts)
 end
 
+function M.section_picker()
+  if not (state.win and vim.api.nvim_win_is_valid(state.win)) then
+    return
+  end
+  local lines = { '' }
+  local width = 0
+  for _, item in ipairs(LEGEND_ITEMS) do
+    local row = '   ' .. item.key .. '   ' .. item.label .. '   '
+    table.insert(lines, row)
+    width = math.max(width, vim.fn.strdisplaywidth(row))
+  end
+  table.insert(lines, '')
+  width = math.max(width, 20)
+  local height = #lines
+
+  local dash = vim.api.nvim_win_get_config(state.win)
+  local row = dash.row + math.floor((dash.height - height) / 2)
+  local col = dash.col + 2
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'editor',
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = 'minimal',
+    border = 'rounded',
+    title = ' Jump to section ',
+    title_pos = 'center',
+    zindex = 200,
+  })
+  vim.wo[win].winhighlight =
+    'Normal:DashboardCardBgAlt,NormalFloat:DashboardCardBgAlt,FloatBorder:DashboardFloatBorder,FloatTitle:Title'
+  vim.wo[win].cursorline = false
+
+  local ns_p = vim.api.nvim_create_namespace 'dashboard_picker'
+  for i, item in ipairs(LEGEND_ITEMS) do
+    pcall(vim.api.nvim_buf_set_extmark, buf, ns_p, i, 3, {
+      end_col = 3 + #item.key,
+      hl_group = '@keyword',
+    })
+  end
+
+  local function close_and_jump(target)
+    if vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+    if state.win and vim.api.nvim_win_is_valid(state.win) then
+      pcall(vim.api.nvim_set_current_win, state.win)
+    end
+    if target then
+      M.jump_to_section(target)
+    end
+  end
+
+  local kopts = { buffer = buf, nowait = true, silent = true }
+  for _, item in ipairs(LEGEND_ITEMS) do
+    vim.keymap.set('n', item.key, function()
+      close_and_jump(item.target)
+    end, kopts)
+  end
+  vim.keymap.set('n', 'q', function()
+    close_and_jump(nil)
+  end, kopts)
+  vim.keymap.set('n', '<Esc>', function()
+    close_and_jump(nil)
+  end, kopts)
+end
+
 function M.jump_to_section(title)
   if not buf_valid() or not state.win or not vim.api.nvim_win_is_valid(state.win) then
     return
@@ -4689,6 +4818,7 @@ end
 local function any_loading()
   return state.data.my_prs == nil
     or state.data.reviews == nil
+    or state.data.tagged == nil
     or state.data.notifications == nil
     or state.data.jira_active == nil
     or state.data.jira_activity == nil
@@ -4725,6 +4855,7 @@ function M.refresh()
   state.data = {
     my_prs = nil,
     reviews = nil,
+    tagged = nil,
     notifications = nil,
     jira_active = nil,
     jira_activity = nil,
@@ -4748,9 +4879,11 @@ function M.refresh()
     if not result then
       state.data.my_prs = err or false
       state.data.reviews = err or false
+      state.data.tagged = err or false
     else
       state.data.my_prs = result.my_prs
       state.data.reviews = result.reviews
+      state.data.tagged = result.tagged
     end
     state.last_refresh = os.time()
     render()
@@ -4836,18 +4969,12 @@ function M.open()
   vim.keymap.set('n', 'i', M.interactive_claude_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
-  vim.keymap.set('n', '1', function()
-    M.jump_to_section 'Awaiting my review'
-  end, opts)
-  vim.keymap.set('n', '2', function()
-    M.jump_to_section 'Passed QA'
-  end, opts)
-  vim.keymap.set('n', '3', function()
-    M.jump_to_section 'GitHub Inbox'
-  end, opts)
-  vim.keymap.set('n', '4', function()
-    M.jump_to_section 'Jira recent'
-  end, opts)
+  for _, item in ipairs(LEGEND_ITEMS) do
+    vim.keymap.set('n', item.key, function()
+      M.jump_to_section(item.target)
+    end, opts)
+  end
+  vim.keymap.set('n', 'J', M.section_picker, opts)
   vim.keymap.set('n', 'C', M.comments_under_cursor, opts)
   vim.keymap.set('n', 'x', function()
     local m = under_cursor()
