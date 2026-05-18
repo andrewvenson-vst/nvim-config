@@ -396,8 +396,9 @@ local function emit(lines, segments)
   local text = ''
   local cols = {}
   for _, seg in ipairs(segments) do
-    cols[#cols + 1] = { col_start = #text, col_end = #text + #seg.text, hl = seg.hl }
-    text = text .. seg.text
+    local clean = (seg.text or ''):gsub('[\r\n]', ' ')
+    cols[#cols + 1] = { col_start = #text, col_end = #text + #clean, hl = seg.hl }
+    text = text .. clean
   end
   table.insert(lines, text)
   return #lines - 1, cols
