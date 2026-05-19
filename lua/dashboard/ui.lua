@@ -329,6 +329,7 @@ local LEGEND_ITEMS = {
   { key = '5', label = 'Notifications', target = 'Notifications' },
   { key = '6', label = 'Jira', target = 'Jira' },
   { key = '7', label = 'Passed QA', target = 'Passed QA' },
+  { key = '9', label = 'Developer Verify', target = 'Developer Verify' },
 }
 
 local function hide_dashboard()
@@ -1499,6 +1500,16 @@ local function render()
       end, '')
     end
   end
+
+  local qa_active = state.data.qa_active
+  if state.filter and state.filter ~= '' and type(qa_active) == 'table' then
+    qa_active = filter_list(qa_active, function(i)
+      return issue_matches(i, state.filter)
+    end)
+  end
+  emit_section(lines, meta, 'Developer Verify', qa_active, function(ls, m, issue)
+    emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
+  end, 'Nothing to verify', { pill_hl = 'DashboardPillQA' })
 
   emit_footer(lines)
 
@@ -4625,6 +4636,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   5       jump to Notifications section
   6       jump to Jira section
   7       jump to Passed QA
+  9       jump to Developer Verify (tickets where you're the QA Assignee)
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
   <leader>gd   local git diff (vs detected base: develop → main → master)
@@ -4821,6 +4833,7 @@ local function any_loading()
     or state.data.tagged == nil
     or state.data.notifications == nil
     or state.data.jira_active == nil
+    or state.data.qa_active == nil
     or state.data.jira_activity == nil
 end
 
@@ -4858,6 +4871,7 @@ function M.refresh()
     tagged = nil,
     notifications = nil,
     jira_active = nil,
+    qa_active = nil,
     jira_activity = nil,
   }
   start_spinner()
@@ -4905,6 +4919,7 @@ function M.refresh()
     end
   end)
   jira.assigned_active(update 'jira_active')
+  jira.qa_assignee_active(update 'qa_active')
   jira.recent_activity(update 'jira_activity')
   if not state.me_account_id then
     jira.fetch_myself(function(id)

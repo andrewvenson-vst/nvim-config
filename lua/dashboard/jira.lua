@@ -184,6 +184,10 @@ function M.assigned_active(callback)
   search('assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
 end
 
+function M.qa_assignee_active(callback)
+  search('"QA Assignee" = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
+end
+
 function M.recent_activity(callback)
   search(
     '(assignee = currentUser() OR reporter = currentUser() OR "QA Assignee" = currentUser()) '
