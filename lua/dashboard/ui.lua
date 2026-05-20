@@ -72,6 +72,7 @@ local function setup_hl()
   set('DashboardDiffLineNrDel', { fg = '#ffeaea', bold = true })
   set('DashboardBadgeAlert', { bg = '#c73838', fg = '#ffffff', bold = true })
   set('DashboardBadgeMuted', { bg = '#2a3045', fg = '#7a8090', bold = false })
+  set('DashboardWinBar', { bg = '#1c2030', fg = '#9aa4b5' })
   -- Markdown inline groups for ADF-rendered Jira descriptions/comments.
   set('@markup.strong', { bold = true })
   set('@markup.italic', { italic = true })
@@ -323,13 +324,9 @@ end
 
 local LEGEND_ITEMS = {
   { key = '1', label = 'Notes', target = 'Notes' },
-  { key = '2', label = 'My PRs', target = 'My PRs' },
-  { key = '3', label = 'Review', target = 'Awaiting my review' },
-  { key = '4', label = 'Tagged in', target = 'Tagged in' },
-  { key = '5', label = 'Notifications', target = 'Notifications' },
-  { key = '6', label = 'Jira', target = 'Jira' },
-  { key = '7', label = 'Passed QA', target = 'Passed QA' },
-  { key = '9', label = 'Developer Verify', target = 'Developer Verify' },
+  { key = '2', label = 'GitHub', target = 'GitHub' },
+  { key = '3', label = 'Notifications', target = 'Notifications' },
+  { key = '4', label = 'Jira', target = 'Jira' },
 }
 
 local function hide_dashboard()
@@ -1122,6 +1119,34 @@ local function count_passed_qa()
   return c
 end
 
+local function count_developer_verify()
+  local j = state.data.qa_active
+  if type(j) ~= 'table' then
+    return nil
+  end
+  return #j
+end
+
+function M.winbar()
+  if not (state.win and vim.api.nvim_win_is_valid(state.win)) then
+    return ''
+  end
+  local items = {
+    { 'GH Inbox', count_unread_notifications() },
+    { 'Jira Inbox', count_jira_recent() },
+    { 'Passed QA', count_passed_qa() },
+    { 'Review', count_reviews() },
+    { 'Verify', count_developer_verify() },
+  }
+  local parts = {}
+  for _, it in ipairs(items) do
+    local hl = (it[2] and it[2] > 0) and 'DashboardBadgeAlert' or 'DashboardBadgeMuted'
+    local count = it[2] == nil and '…' or tostring(it[2])
+    table.insert(parts, '%#' .. hl .. '# ' .. it[1] .. '  ' .. count .. ' %#DashboardWinBar#')
+  end
+  return '%#DashboardWinBar#  ' .. table.concat(parts, '   ') .. '  '
+end
+
 local function badge_segments(label, count)
   local hl = (count and count > 0) and 'DashboardBadgeAlert' or 'DashboardBadgeMuted'
   local display = count == nil and '…' or tostring(count)
@@ -1132,39 +1157,7 @@ local function badge_segments(label, count)
 end
 
 local function emit_header(lines)
-  local title_text = '  ★  Status Dashboard'
-  local badges = {
-    { 'GH', count_unread_notifications() },
-    { 'Jira', count_jira_recent() },
-  }
-  local badge_groups = {}
-  local badges_w = 0
-  for i, b in ipairs(badges) do
-    local segs = badge_segments(b[1], b[2])
-    table.insert(badge_groups, segs)
-    for _, s in ipairs(segs) do
-      badges_w = badges_w + vim.fn.strdisplaywidth(s.text)
-    end
-    if i < #badges then
-      badges_w = badges_w + 3
-    end
-  end
-  local title_w = vim.fn.strdisplaywidth(title_text)
-  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win)) and vim.api.nvim_win_get_width(state.win) or 140
-  local filler_w = math.max(1, win_w - title_w - badges_w - 2)
-  local row = {
-    { text = title_text, hl = 'Title' },
-    { text = string.rep(' ', filler_w), hl = nil },
-  }
-  for i, segs in ipairs(badge_groups) do
-    for _, s in ipairs(segs) do
-      table.insert(row, s)
-    end
-    if i < #badge_groups then
-      table.insert(row, { text = '   ', hl = nil })
-    end
-  end
-  emit_segments(lines, row)
+  emit_segments(lines, { { text = '  ★  Status Dashboard', hl = 'Title' } })
   emit_segments(lines, {
     { text = '  ', hl = nil },
     { text = 'g?', hl = '@keyword' },
@@ -4630,13 +4623,9 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   g?      this help
   J       open the centered jump picker (one key to pick a section)
   1       jump to Notes
-  2       jump to My PRs
-  3       jump to Awaiting my review
-  4       jump to Tagged in
-  5       jump to Notifications section
-  6       jump to Jira section
-  7       jump to Passed QA
-  9       jump to Developer Verify (tickets where you're the QA Assignee)
+  2       jump to GitHub
+  3       jump to Notifications
+  4       jump to Jira
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
   <leader>gd   local git diff (vs detected base: develop → main → master)
@@ -4937,8 +4926,9 @@ local function apply_dashboard_win_opts()
   vim.wo[state.win].cursorline = false
   vim.wo[state.win].wrap = false
   vim.wo[state.win].winhighlight =
-    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder'
+    'Normal:DashboardNormal,NormalFloat:DashboardNormal,FloatBorder:DashboardFloatBorder,WinBar:DashboardWinBar,WinBarNC:DashboardWinBar'
   vim.wo[state.win].sidescrolloff = 4
+  vim.wo[state.win].winbar = '%{%v:lua.require("dashboard.ui").winbar()%}'
 end
 
 function M.open()

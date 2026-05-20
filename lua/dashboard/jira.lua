@@ -185,7 +185,11 @@ function M.assigned_active(callback)
 end
 
 function M.qa_assignee_active(callback)
-  search('"QA Assignee" = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
+  search(
+    '"QA Assignee" = currentUser() AND status NOT IN ("Passed QA", "Done", "Closed", "On Prod") '
+      .. 'AND statusCategory != Done ORDER BY updated DESC',
+    callback
+  )
 end
 
 function M.recent_activity(callback)
