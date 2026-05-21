@@ -4722,7 +4722,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   <leader>gD   local git diff vs custom branch/commit (prompts)
 
 ## Notes section
-  n       new note (auto-prepends "- ")
+  N       new note (auto-prepends "- ")
   T       new todo (auto-prepends "- [ ] ")
   x       toggle todo checkbox on the cursor row
   <CR>    open today's notes file for editing
@@ -5089,7 +5089,7 @@ function M.open()
   vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
   vim.keymap.set('n', 'f', M.filter_prompt, opts)
   vim.keymap.set('n', 'g?', M.show_help, opts)
-  vim.keymap.set('n', 'n', M.add_note, opts)
+  vim.keymap.set('n', 'N', M.add_note, opts)
 
   vim.api.nvim_create_autocmd('FocusGained', {
     buffer = state.buf,
