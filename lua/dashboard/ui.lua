@@ -480,9 +480,13 @@ local function emit_divider(lines, label)
   end
 end
 
-local function emit_subhead(lines, title, count, pill_hl)
+local function emit_subhead(lines, title, count, pill_hl, collapsed)
   local count_str = count and tostring(count) or ''
   local segments = { { text = '  ', hl = nil } }
+  if collapsed ~= nil then
+    local arrow = collapsed and '▸' or '▾'
+    table.insert(segments, { text = arrow .. ' ', hl = 'DashboardAccentGithub' })
+  end
   if pill_hl then
     local inner = count_str ~= '' and (count_str .. '  ' .. title) or title
     table.insert(segments, { text = ' ' .. inner .. ' ', hl = pill_hl })
@@ -498,6 +502,7 @@ local function emit_subhead(lines, title, count, pill_hl)
   if state.section_lines then
     state.section_lines[title] = idx
   end
+  return idx
 end
 
 local SPINNER_FRAMES = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
@@ -727,13 +732,63 @@ local function jira_status_pill(status)
   return 'DashboardPillMuted'
 end
 
-local function emit_repo_header(lines, name, count)
+local SECTION_COLLAPSE_DEFAULT = {
+  ['My PRs'] = true,
+  ['Awaiting my review'] = true,
+  ['Tagged in'] = true,
+}
+
+local SECTION_LEVEL_COLLAPSE_DEFAULT = {
+  ['In Progress'] = true,
+  ['Peer Review'] = true,
+  ['Needs QA'] = true,
+  ['In QA'] = true,
+  ['Passed QA'] = true,
+  ['Refinement'] = true,
+  ['Other'] = true,
+  ['Developer Verify'] = true,
+}
+
+local function is_section_collapsed(title)
+  state.collapsed_sections = state.collapsed_sections or {}
+  local explicit = state.collapsed_sections[title]
+  if explicit ~= nil then
+    return explicit
+  end
+  return SECTION_LEVEL_COLLAPSE_DEFAULT[title] or false
+end
+
+local function toggle_section_collapsed(title)
+  state.collapsed_sections = state.collapsed_sections or {}
+  state.collapsed_sections[title] = not is_section_collapsed(title)
+end
+
+local function is_repo_collapsed(section, repo)
+  state.collapsed_repos = state.collapsed_repos or {}
+  state.collapsed_repos[section] = state.collapsed_repos[section] or {}
+  local explicit = state.collapsed_repos[section][repo]
+  if explicit ~= nil then
+    return explicit
+  end
+  return SECTION_COLLAPSE_DEFAULT[section] or false
+end
+
+local function toggle_repo_collapsed(section, repo)
+  state.collapsed_repos = state.collapsed_repos or {}
+  state.collapsed_repos[section] = state.collapsed_repos[section] or {}
+  state.collapsed_repos[section][repo] = not is_repo_collapsed(section, repo)
+end
+
+local function emit_repo_header(lines, meta, section, name, count, collapsed)
+  local arrow = collapsed and '▸' or '▾'
   local idx, cols = emit(lines, {
     { text = '    ', hl = nil },
+    { text = arrow .. ' ', hl = 'DashboardAccentGithub' },
     { text = tostring(count) .. '  ', hl = '@number' },
     { text = name, hl = '@string' },
   })
   paint(idx, cols)
+  meta[idx + 1] = { kind = 'pr_repo_header', section = section, repo = name }
 end
 
 local function emit_pr(lines, meta, pr, opts)
@@ -956,9 +1011,15 @@ local function subsection_box(lines, kind)
 end
 
 local function emit_section(lines, meta, title, items, emit_item, empty_label, opts)
+  opts = opts or {}
   local count = type(items) == 'table' and #items or nil
+  local collapsible = opts.collapsible and type(items) == 'table' and #items > 0
+  local collapsed = collapsible and is_section_collapsed(title) or false
   subsection_box(lines, 'top')
-  emit_subhead(lines, title, count, opts and opts.pill_hl or nil)
+  local subhead_idx = emit_subhead(lines, title, count, opts.pill_hl, collapsible and collapsed or nil)
+  if collapsible then
+    meta[subhead_idx + 1] = { kind = 'jira_section_header', title = title }
+  end
   if items == nil then
     emit_status(lines, 'loading', 'Loading…')
   elseif items == false then
@@ -967,7 +1028,7 @@ local function emit_section(lines, meta, title, items, emit_item, empty_label, o
     emit_status(lines, 'error', items)
   elseif #items == 0 then
     emit_status(lines, 'empty', empty_label or 'Nothing here')
-  else
+  elseif not collapsed then
     for _, item in ipairs(items) do
       emit_item(lines, meta, item)
     end
@@ -1010,15 +1071,18 @@ local function emit_pr_section(lines, meta, title, prs, empty_label, pr_opts)
       if i > 1 then
         emit_blank(lines)
       end
-      emit_repo_header(lines, repo_name, #groups[repo_name])
-      for _, pr in ipairs(groups[repo_name]) do
-        local pr_inner_opts = { skip_repo = true, deep_indent = true }
-        if pr_opts then
-          for k, v in pairs(pr_opts) do
-            pr_inner_opts[k] = v
+      local collapsed = is_repo_collapsed(title, repo_name)
+      emit_repo_header(lines, meta, title, repo_name, #groups[repo_name], collapsed)
+      if not collapsed then
+        for _, pr in ipairs(groups[repo_name]) do
+          local pr_inner_opts = { skip_repo = true, deep_indent = true }
+          if pr_opts then
+            for k, v in pairs(pr_opts) do
+              pr_inner_opts[k] = v
+            end
           end
+          emit_pr(lines, meta, pr, pr_inner_opts)
         end
-        emit_pr(lines, meta, pr, pr_inner_opts)
       end
     end
   end
@@ -1475,7 +1539,7 @@ local function render()
         sort_by_has_pr(items)
         emit_section(lines, meta, status, items, function(ls, m, issue)
           emit_issue(ls, m, issue, { pr_pool = pr_pool, section_status = status })
-        end, '', { pill_hl = jira_status_pill(status) })
+        end, '', { pill_hl = jira_status_pill(status), collapsible = true })
       end
     end
     local other = {}
@@ -1490,7 +1554,7 @@ local function render()
       sort_by_has_pr(other)
       emit_section(lines, meta, 'Other', other, function(ls, m, issue)
         emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
-      end, '')
+      end, '', { collapsible = true })
     end
   end
 
@@ -1502,7 +1566,7 @@ local function render()
   end
   emit_section(lines, meta, 'Developer Verify', qa_active, function(ls, m, issue)
     emit_issue(ls, m, issue, { show_status = true, pr_pool = pr_pool })
-  end, 'Nothing to verify', { pill_hl = 'DashboardPillQA' })
+  end, 'Nothing to verify', { pill_hl = 'DashboardPillQA', collapsible = true })
 
   emit_footer(lines)
 
@@ -1548,6 +1612,32 @@ end
 function M.open_under_cursor()
   local m = under_cursor()
   if not m then
+    return
+  end
+  if m.kind == 'pr_repo_header' then
+    toggle_repo_collapsed(m.section, m.repo)
+    render()
+    if state.win and vim.api.nvim_win_is_valid(state.win) then
+      for i, mm in ipairs(state.line_meta) do
+        if mm and mm.kind == 'pr_repo_header' and mm.section == m.section and mm.repo == m.repo then
+          pcall(vim.api.nvim_win_set_cursor, state.win, { i, 0 })
+          break
+        end
+      end
+    end
+    return
+  end
+  if m.kind == 'jira_section_header' then
+    toggle_section_collapsed(m.title)
+    render()
+    if state.win and vim.api.nvim_win_is_valid(state.win) then
+      for i, mm in ipairs(state.line_meta) do
+        if mm and mm.kind == 'jira_section_header' and mm.title == m.title then
+          pcall(vim.api.nvim_win_set_cursor, state.win, { i, 0 })
+          break
+        end
+      end
+    end
     return
   end
   if m.kind == 'note' and m.path then
@@ -4615,7 +4705,7 @@ end
 local HELP_TEXT = [[# Status Dashboard — Keymaps
 
 ## Global
-  <CR>    open url in browser
+  <CR>    open url in browser; on a repo / jira section header: collapse / expand
   y       yank url
   f       filter every section by substring
   r       refresh now
