@@ -181,7 +181,11 @@ function M.fetch_myself(callback)
 end
 
 function M.assigned_active(callback)
-  search('assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC', callback)
+  search(
+    'assignee = currentUser() AND statusCategory != Done '
+      .. 'AND status NOT IN ("New Ticket", "On Prod", "Done", "Closed") ORDER BY updated DESC',
+    callback
+  )
 end
 
 function M.qa_assignee_active(callback)
