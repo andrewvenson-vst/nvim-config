@@ -893,9 +893,25 @@ local function emit_issue(lines, meta, issue, opts)
 
   local idx, cols = emit(lines, segments)
   paint(idx, cols)
-  meta[idx + 1] = { url = issue.url, kind = 'jira', key = issue.key }
 
   local matches = related_prs(issue.key, opts.pr_pool or {})
+  local related_repos = {}
+  local seen_repos = {}
+  for _, pr in ipairs(matches) do
+    local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
+    if not seen_repos[repo] then
+      seen_repos[repo] = true
+      table.insert(related_repos, repo)
+    end
+  end
+  meta[idx + 1] = {
+    url = issue.url,
+    kind = 'jira',
+    key = issue.key,
+    summary = issue.summary,
+    related_repos = related_repos,
+  }
+
   for _, pr in ipairs(matches) do
     local repo = (pr.repository and pr.repository.nameWithOwner) or '?'
     local short = repo:match '/(.+)$' or repo
@@ -1740,6 +1756,200 @@ local function resolve_repo_path(repo)
   return vim.fn.expand(raw)
 end
 
+local function slugify_summary(s)
+  s = (s or ''):lower()
+  s = s:gsub('[^a-z0-9]+', '-')
+  s = s:gsub('^%-+', ''):gsub('%-+$', '')
+  if #s > 40 then
+    local trimmed = s:sub(1, 40):gsub('%-[^%-]*$', '')
+    if #trimmed > 0 then
+      s = trimmed
+    else
+      s = s:sub(1, 40)
+    end
+  end
+  return s
+end
+
+local function git_in(repo_path, args, cb)
+  local cmd = { 'git', '-C', repo_path }
+  for _, a in ipairs(args) do
+    table.insert(cmd, a)
+  end
+  vim.system(cmd, { text = true }, function(obj)
+    vim.schedule(function()
+      cb(obj)
+    end)
+  end)
+end
+
+local function git_ok(obj)
+  return obj.code == 0
+end
+
+local function git_err(obj, fallback)
+  local s = obj.stderr or ''
+  s = s:gsub('^%s+', ''):gsub('%s+$', '')
+  if s == '' then
+    s = (obj.stdout or ''):gsub('^%s+', ''):gsub('%s+$', '')
+  end
+  if s == '' then
+    s = fallback or ('git exit ' .. tostring(obj.code))
+  end
+  return s
+end
+
+local function repo_short(repo)
+  return repo:match '/(.+)$' or repo
+end
+
+-- Open the repo in this tab and notify. Used after branching/switching.
+local function enter_repo(repo_path, message)
+  vim.cmd('tcd ' .. vim.fn.fnameescape(repo_path))
+  local readme = repo_path .. '/README.md'
+  if vim.fn.filereadable(readme) == 1 then
+    vim.cmd('edit ' .. vim.fn.fnameescape(readme))
+  else
+    vim.cmd('edit ' .. vim.fn.fnameescape(repo_path))
+  end
+  vim.notify(message, vim.log.levels.INFO)
+end
+
+-- Switch to an existing branch, stashing dirty work first.
+local function do_switch_branch(repo_path, branch_name, on_done)
+  git_in(repo_path, { 'status', '--porcelain' }, function(status_obj)
+    if not git_ok(status_obj) then
+      vim.notify('git status failed: ' .. git_err(status_obj), vim.log.levels.ERROR)
+      return
+    end
+    local dirty = (status_obj.stdout or '') ~= ''
+
+    local function checkout()
+      git_in(repo_path, { 'checkout', branch_name }, function(co_obj)
+        if not git_ok(co_obj) then
+          vim.notify('checkout failed: ' .. git_err(co_obj), vim.log.levels.ERROR)
+          return
+        end
+        M.close()
+        local msg = string.format('Switched to %s in %s', branch_name, repo_short(repo_path))
+        if dirty then
+          msg = msg .. ' (stashed local changes)'
+        end
+        enter_repo(repo_path, msg)
+        if on_done then
+          on_done()
+        end
+      end)
+    end
+
+    if dirty then
+      local stamp = os.date '%Y-%m-%d %H:%M'
+      local stash_msg = string.format('auto: before switch to %s (%s)', branch_name, stamp)
+      git_in(repo_path, { 'stash', 'push', '-u', '-m', stash_msg }, function(stash_obj)
+        if not git_ok(stash_obj) then
+          vim.notify('git stash failed: ' .. git_err(stash_obj), vim.log.levels.ERROR)
+          return
+        end
+        checkout()
+      end)
+    else
+      checkout()
+    end
+  end)
+end
+
+-- Branch from latest main for a Jira ticket. If a branch already exists for
+-- this ticket, switch to it instead. Aborts if main can't fast-forward.
+local function do_branch(repo_path, ticket_key, summary)
+  git_in(repo_path, { 'rev-parse', '--is-inside-work-tree' }, function(in_tree)
+    if not git_ok(in_tree) then
+      vim.notify(repo_path .. ' is not a git repo', vim.log.levels.ERROR)
+      return
+    end
+
+    git_in(repo_path, { 'branch', '--list', ticket_key .. '*' }, function(list_obj)
+      if not git_ok(list_obj) then
+        vim.notify('git branch failed: ' .. git_err(list_obj), vim.log.levels.ERROR)
+        return
+      end
+      local key_pat = ticket_key:gsub('([%(%)%.%%%+%-%*%?%[%]%^%$])', '%%%1')
+      local existing
+      for line in (list_obj.stdout or ''):gmatch '[^\n]+' do
+        local name = line:gsub('^[%s%*]+', ''):gsub('%s+$', '')
+        if name == ticket_key or name:match('^' .. key_pat .. '[_%-]') then
+          existing = name
+          break
+        end
+      end
+      if existing then
+        do_switch_branch(repo_path, existing)
+        return
+      end
+
+      local slug = slugify_summary(summary)
+      local new_branch = slug ~= '' and (ticket_key .. '_' .. slug) or ticket_key
+
+      git_in(repo_path, { 'status', '--porcelain' }, function(status_obj)
+        if not git_ok(status_obj) then
+          vim.notify('git status failed: ' .. git_err(status_obj), vim.log.levels.ERROR)
+          return
+        end
+        local dirty = (status_obj.stdout or '') ~= ''
+
+        local function fetch_then_branch()
+          git_in(repo_path, { 'fetch', 'origin', 'main' }, function(fetch_obj)
+            if not git_ok(fetch_obj) then
+              vim.notify('git fetch failed: ' .. git_err(fetch_obj), vim.log.levels.ERROR)
+              return
+            end
+            git_in(repo_path, { 'checkout', 'main' }, function(co_obj)
+              if not git_ok(co_obj) then
+                vim.notify('checkout main failed: ' .. git_err(co_obj), vim.log.levels.ERROR)
+                return
+              end
+              git_in(repo_path, { 'merge', '--ff-only', 'origin/main' }, function(ff_obj)
+                if not git_ok(ff_obj) then
+                  vim.notify(
+                    'main is not fast-forwardable from origin/main — reconcile manually:\n' .. git_err(ff_obj),
+                    vim.log.levels.ERROR
+                  )
+                  return
+                end
+                git_in(repo_path, { 'checkout', '-b', new_branch }, function(nb_obj)
+                  if not git_ok(nb_obj) then
+                    vim.notify('checkout -b failed: ' .. git_err(nb_obj), vim.log.levels.ERROR)
+                    return
+                  end
+                  M.close()
+                  local msg = string.format('Branched %s in %s (off latest main)', new_branch, repo_short(repo_path))
+                  if dirty then
+                    msg = msg .. ' — stashed local changes'
+                  end
+                  enter_repo(repo_path, msg)
+                end)
+              end)
+            end)
+          end)
+        end
+
+        if dirty then
+          local stamp = os.date '%Y-%m-%d %H:%M'
+          local stash_msg = string.format('auto: before branching to %s (%s)', ticket_key, stamp)
+          git_in(repo_path, { 'stash', 'push', '-u', '-m', stash_msg }, function(stash_obj)
+            if not git_ok(stash_obj) then
+              vim.notify('git stash failed: ' .. git_err(stash_obj), vim.log.levels.ERROR)
+              return
+            end
+            fetch_then_branch()
+          end)
+        else
+          fetch_then_branch()
+        end
+      end)
+    end)
+  end)
+end
+
 function M.checkout_under_cursor()
   local m = under_cursor()
   if not m or not m.pr then
@@ -1766,6 +1976,193 @@ function M.checkout_under_cursor()
         vim.cmd('edit ' .. vim.fn.fnameescape(repo_path))
       end
     end)
+  end)
+end
+
+-- Build a list of repo display rows for vim.ui.select: starred repos
+-- (those with related PRs for this ticket) first, then the rest of
+-- repo_paths alphabetically.
+local function build_repo_choices(starred)
+  local star = {}
+  for _, r in ipairs(starred or {}) do
+    star[r] = true
+  end
+  local starred_list, rest = {}, {}
+  for repo, _ in pairs(config.repo_paths) do
+    if star[repo] then
+      table.insert(starred_list, repo)
+    else
+      table.insert(rest, repo)
+    end
+  end
+  table.sort(starred_list)
+  table.sort(rest)
+  local choices = {}
+  for _, r in ipairs(starred_list) do
+    table.insert(choices, { repo = r, label = '★ ' .. repo_short(r) })
+  end
+  for _, r in ipairs(rest) do
+    table.insert(choices, { repo = r, label = '  ' .. repo_short(r) })
+  end
+  return choices
+end
+
+-- Scan all configured repo_paths in parallel for local VST-* branches.
+-- Calls cb(branches) once all repos have responded, where branches is a list
+-- of { repo, repo_path, branch } entries.
+local function scan_vst_branches(cb)
+  local repos = {}
+  for repo, _ in pairs(config.repo_paths) do
+    local path = resolve_repo_path(repo)
+    if path then
+      table.insert(repos, { repo = repo, path = path })
+    end
+  end
+  if #repos == 0 then
+    cb({})
+    return
+  end
+  local branches = {}
+  local pending = #repos
+  for _, r in ipairs(repos) do
+    git_in(r.path, { 'branch', '--list', 'VST-*' }, function(obj)
+      if git_ok(obj) then
+        for line in (obj.stdout or ''):gmatch '[^\n]+' do
+          local name = line:gsub('^[%s%*]+', ''):gsub('%s+$', '')
+          if name ~= '' then
+            table.insert(branches, { repo = r.repo, repo_path = r.path, branch = name })
+          end
+        end
+      end
+      pending = pending - 1
+      if pending == 0 then
+        cb(branches)
+      end
+    end)
+  end
+end
+
+function M.branch_picker()
+  local jira = require 'dashboard.jira'
+  local results = { tickets = nil, branches = nil }
+  local errors = {}
+  local function maybe_open()
+    if results.tickets == nil or results.branches == nil then
+      return
+    end
+    local items = {}
+    for _, t in ipairs(results.tickets) do
+      table.insert(items, {
+        kind = 'ticket',
+        key = t.key,
+        summary = t.summary or '',
+        status = t.status or '',
+        label = string.format('[ticket] %s  %s  %s', t.key, t.status or '?', t.summary or ''),
+      })
+    end
+    for _, b in ipairs(results.branches) do
+      table.insert(items, {
+        kind = 'branch',
+        repo = b.repo,
+        repo_path = b.repo_path,
+        branch = b.branch,
+        label = string.format('[branch] %s · %s', repo_short(b.repo), b.branch),
+      })
+    end
+    if #items == 0 then
+      local msg = 'No active tickets or local VST-* branches found'
+      if #errors > 0 then
+        msg = msg .. ' (' .. table.concat(errors, '; ') .. ')'
+      end
+      vim.notify(msg, vim.log.levels.WARN)
+      return
+    end
+    vim.ui.select(items, {
+      prompt = 'Jira branch:',
+      format_item = function(it)
+        return it.label
+      end,
+    }, function(choice)
+      if not choice then
+        return
+      end
+      if choice.kind == 'branch' then
+        do_switch_branch(choice.repo_path, choice.branch)
+        return
+      end
+      -- Ticket: pick repo, then branch
+      local related = {}
+      for _, b in ipairs(results.branches) do
+        local key = b.branch:match '^(VST%-%d+)'
+        if key == choice.key then
+          table.insert(related, b.repo)
+        end
+      end
+      local repo_choices = build_repo_choices(related)
+      if #repo_choices == 0 then
+        vim.notify('No repos configured in repo_paths', vim.log.levels.WARN)
+        return
+      end
+      vim.ui.select(repo_choices, {
+        prompt = string.format('Branch %s in repo:', choice.key),
+        format_item = function(c)
+          return c.label
+        end,
+      }, function(rc)
+        if not rc then
+          return
+        end
+        local repo_path = resolve_repo_path(rc.repo)
+        if not repo_path then
+          vim.notify('No local path configured for ' .. rc.repo, vim.log.levels.WARN)
+          return
+        end
+        do_branch(repo_path, choice.key, choice.summary)
+      end)
+    end)
+  end
+
+  jira.assigned_active(function(tickets, err)
+    if err then
+      table.insert(errors, 'tickets: ' .. err)
+      results.tickets = {}
+    else
+      results.tickets = tickets or {}
+    end
+    maybe_open()
+  end)
+  scan_vst_branches(function(branches)
+    results.branches = branches
+    maybe_open()
+  end)
+end
+
+function M.branch_under_cursor()
+  local m = under_cursor()
+  if not m or m.kind ~= 'jira' or not m.key then
+    return
+  end
+  local ticket_key, summary = m.key, m.summary or ''
+  local choices = build_repo_choices(m.related_repos)
+  if #choices == 0 then
+    vim.notify('No repos configured in repo_paths', vim.log.levels.WARN)
+    return
+  end
+  vim.ui.select(choices, {
+    prompt = string.format('Branch %s in repo:', ticket_key),
+    format_item = function(c)
+      return c.label
+    end,
+  }, function(choice)
+    if not choice then
+      return
+    end
+    local repo_path = resolve_repo_path(choice.repo)
+    if not repo_path then
+      vim.notify('No local path configured for ' .. choice.repo, vim.log.levels.WARN)
+      return
+    end
+    do_branch(repo_path, ticket_key, summary)
   end)
 end
 
@@ -4722,6 +5119,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   <leader>or   focus last result window
   <leader>gd   local git diff (vs detected base: develop → main → master)
   <leader>gD   local git diff vs custom branch/commit (prompts)
+  <leader>jb   Jira branch picker (active tickets + existing local VST-* branches)
 
 ## Notes section
   N       new note (auto-prepends "- ")
@@ -4738,6 +5136,8 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   ?       claude prompt picker (summary / understand / risks / next / code review)
 
 ## Jira rows
+  b       branch off latest main for this ticket (prompts repo;
+          stashes dirty work; switches to existing VST-NNN_* branch if any)
   C       read ticket description + comments in a panel
 
 ## Notifications
@@ -5063,6 +5463,7 @@ function M.open()
   vim.keymap.set('n', '<CR>', M.open_under_cursor, opts)
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
+  vim.keymap.set('n', 'b', M.branch_under_cursor, opts)
   vim.keymap.set('n', 'i', M.interactive_claude_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)

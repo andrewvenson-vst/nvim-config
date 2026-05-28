@@ -30,6 +30,10 @@ function M.setup(opts)
   vim.keymap.set('n', '<leader>gD', function()
     require('dashboard.ui').show_local_diff_with_prompt()
   end, { desc = '[G]it local [D]iff vs custom branch/commit' })
+
+  vim.keymap.set('n', '<leader>jb', function()
+    require('dashboard.ui').branch_picker()
+  end, { desc = '[J]ira [B]ranch picker (tickets + existing local branches)' })
 end
 
 return M
