@@ -4430,20 +4430,45 @@ local function fetch_local_diff(callback, target_override)
       end
       local function with_target(target, label)
         local results = { tracked = nil, untracked = nil }
-        local pending = 2
+        local resolved_label = label
+        local pending = 3
         local function done_inner()
           pending = pending - 1
           if pending > 0 then
             return
           end
           local diff = (results.tracked or '') .. (results.untracked or '')
-          callback(diff, nil, label)
+          callback(diff, nil, resolved_label)
         end
         vim.system({ 'git', '-C', cwd, 'merge-base', target, 'HEAD' }, { text = true }, function(mb)
           vim.schedule(function()
             local diff_target = (mb.code == 0 and mb.stdout and mb.stdout ~= '')
                 and vim.trim(mb.stdout)
               or target
+            vim.system(
+              { 'git', '-C', cwd, 'log', '-1', '--format=%h%x09%s', diff_target },
+              { text = true },
+              function(lg)
+                vim.schedule(function()
+                  if lg.code == 0 and lg.stdout and lg.stdout ~= '' then
+                    local line = vim.trim(lg.stdout)
+                    local sha, subject = line:match '^(%S+)\t(.*)$'
+                    if sha then
+                      if subject and #subject > 60 then
+                        subject = subject:sub(1, 57) .. '…'
+                      end
+                      if label == sha or label:sub(1, #sha) == sha then
+                        resolved_label = string.format('%s "%s"', sha, subject or '')
+                      else
+                        resolved_label =
+                          string.format('%s @ %s "%s"', label, sha, subject or '')
+                      end
+                    end
+                  end
+                  done_inner()
+                end)
+              end
+            )
             vim.system({ 'git', '-C', cwd, 'diff', diff_target }, { text = true }, function(obj)
               vim.schedule(function()
                 if obj.code ~= 0 then
@@ -4736,18 +4761,42 @@ local function pick_commit(callback)
   end)
 end
 
-function M.show_local_diff_with_prompt()
-  vim.ui.select({ 'Branch', 'Commit' }, { prompt = 'Diff vs:' }, function(choice)
-    if choice == 'Branch' then
-      pick_branch(function(target)
-        open_local_diff(target)
-      end)
-    elseif choice == 'Commit' then
-      pick_commit(function(target)
-        open_local_diff(target)
+local function resolve_branch_ref(cwd, name, callback)
+  vim.system(
+    { 'git', '-C', cwd, 'rev-parse', '--verify', '--quiet', 'origin/' .. name },
+    { text = true },
+    function(obj)
+      vim.schedule(function()
+        if obj.code == 0 then
+          callback('origin/' .. name)
+        else
+          callback(name)
+        end
       end)
     end
-  end)
+  )
+end
+
+function M.show_local_diff_with_prompt()
+  vim.ui.select(
+    { 'develop', 'main', 'Branch…', 'Commit…' },
+    { prompt = 'Diff vs:' },
+    function(choice)
+      if choice == 'develop' or choice == 'main' then
+        resolve_branch_ref(vim.fn.getcwd(), choice, function(target)
+          open_local_diff(target)
+        end)
+      elseif choice == 'Branch…' then
+        pick_branch(function(target)
+          open_local_diff(target)
+        end)
+      elseif choice == 'Commit…' then
+        pick_commit(function(target)
+          open_local_diff(target)
+        end)
+      end
+    end
+  )
 end
 
 function M.diff_under_cursor()
@@ -5117,8 +5166,9 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   4       jump to Jira
   <leader>od   open / refocus dashboard
   <leader>or   focus last result window
-  <leader>gd   local git diff (vs detected base: develop → main → master)
-  <leader>gD   local git diff vs custom branch/commit (prompts)
+  <leader>gd   local git diff vs auto-detected base (develop → main → master)
+  <leader>gD   local git diff vs chosen target (develop / main / Branch… / Commit…)
+               diff title shows the resolved merge-base SHA + commit subject
   <leader>jb   Jira branch picker (active tickets + existing local VST-* branches)
 
 ## Notes section
