@@ -21,6 +21,7 @@ require('dashboard').setup {
     'Blocked',
     'Blocked / On Hold',
     'On Hold',
+    'To Do',
     'In Progress',
     'Peer Review',
     'Needs QA',

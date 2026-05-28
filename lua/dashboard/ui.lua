@@ -115,6 +115,7 @@ local config = {
   repo_paths = {},
   refresh_after = 60,
   jira_status_order = {
+    'To Do',
     'In Progress',
     'Peer Review',
     'Needs QA',
@@ -739,6 +740,7 @@ local SECTION_COLLAPSE_DEFAULT = {
 }
 
 local SECTION_LEVEL_COLLAPSE_DEFAULT = {
+  ['To Do'] = true,
   ['In Progress'] = true,
   ['Peer Review'] = true,
   ['Needs QA'] = true,
