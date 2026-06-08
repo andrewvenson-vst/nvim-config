@@ -4352,6 +4352,46 @@ function M.assign_qa_under_cursor()
   end)
 end
 
+function M.transition_under_cursor()
+  local m = under_cursor()
+  if not m or m.kind ~= 'jira' or not m.key then
+    vim.notify('Place cursor on a Jira ticket row first', vim.log.levels.INFO)
+    return
+  end
+  local key = m.key
+  require('dashboard.jira').get_transitions(key, function(transitions, err)
+    if not transitions then
+      vim.notify('Transitions failed: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      return
+    end
+    if #transitions == 0 then
+      vim.notify('No transitions available for ' .. key, vim.log.levels.INFO)
+      return
+    end
+    local labels = {}
+    for _, t in ipairs(transitions) do
+      table.insert(labels, t.name .. ' → ' .. t.to_status)
+    end
+    vim.ui.select(labels, { prompt = 'Transition ' .. key .. ' to:' }, function(_, idx)
+      if not idx then
+        return
+      end
+      local chosen = transitions[idx]
+      vim.notify('Transitioning ' .. key .. ' (' .. chosen.name .. ')…', vim.log.levels.INFO)
+      require('dashboard.jira').transition(key, chosen.id, function(ok, terr)
+        if not ok then
+          vim.notify('Transition failed: ' .. (terr or 'unknown'), vim.log.levels.ERROR)
+          return
+        end
+        vim.notify(key .. ' → ' .. chosen.to_status, vim.log.levels.INFO)
+        if buf_valid() then
+          M.refresh()
+        end
+      end)
+    end)
+  end)
+end
+
 function M.show_jira_activity(items)
   if not items or type(items) ~= 'table' or #items == 0 then
     vim.notify('No recent Jira activity', vim.log.levels.INFO)
@@ -5247,6 +5287,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   C       read ticket description + comments in a panel
   A       assign this ticket to me (then refresh)
   Q       set me as QA Assignee on this ticket (then refresh)
+  S       transition this ticket's status (picker, then refresh)
 
 ## Notifications
   x       mark notification as read
@@ -5583,6 +5624,7 @@ function M.open()
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
   vim.keymap.set('n', 'A', M.assign_self_under_cursor, opts)
   vim.keymap.set('n', 'Q', M.assign_qa_under_cursor, opts)
+  vim.keymap.set('n', 'S', M.transition_under_cursor, opts)
   for _, item in ipairs(LEGEND_ITEMS) do
     vim.keymap.set('n', item.key, function()
       M.jump_to_section(item.target)

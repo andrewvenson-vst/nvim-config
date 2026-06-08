@@ -271,6 +271,97 @@ function M.assign_self(key, callback)
   end)
 end
 
+function M.get_transitions(key, callback)
+  if not key then
+    callback(nil, 'no key')
+    return
+  end
+  local auth, err = creds()
+  if not auth then
+    callback(nil, err or 'JIRA_EMAIL or JIRA_API_TOKEN not set')
+    return
+  end
+  vim.system({
+    'curl',
+    '-sS',
+    config.base_url .. '/rest/api/3/issue/' .. key .. '/transitions',
+    '-H',
+    'Authorization: Basic ' .. auth,
+    '-H',
+    'Accept: application/json',
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('curl exit ' .. obj.code))
+        return
+      end
+      local ok, parsed = pcall(vim.json.decode, obj.stdout, { luanil = { object = true, array = true } })
+      if not ok or type(parsed) ~= 'table' then
+        callback(nil, 'json parse error')
+        return
+      end
+      if parsed.errorMessages and #parsed.errorMessages > 0 then
+        callback(nil, table.concat(parsed.errorMessages, '; '))
+        return
+      end
+      local transitions = {}
+      for _, t in ipairs(parsed.transitions or {}) do
+        table.insert(transitions, {
+          id = tostring(t.id),
+          name = t.name or '?',
+          to_status = (t.to and t.to.name) or '?',
+        })
+      end
+      callback(transitions)
+    end)
+  end)
+end
+
+function M.transition(key, transition_id, callback)
+  if not key or not transition_id then
+    callback(nil, 'no key/transition')
+    return
+  end
+  local auth, err = creds()
+  if not auth then
+    callback(nil, err or 'JIRA_EMAIL or JIRA_API_TOKEN not set')
+    return
+  end
+  local body = vim.json.encode { transition = { id = tostring(transition_id) } }
+  vim.system({
+    'curl',
+    '-sS',
+    '-o',
+    '/dev/null',
+    '-w',
+    '%{http_code}',
+    '-X',
+    'POST',
+    config.base_url .. '/rest/api/3/issue/' .. key .. '/transitions',
+    '-H',
+    'Authorization: Basic ' .. auth,
+    '-H',
+    'Accept: application/json',
+    '-H',
+    'Content-Type: application/json',
+    '-d',
+    body,
+  }, { text = true }, function(obj)
+    vim.schedule(function()
+      if obj.code ~= 0 then
+        callback(nil, (obj.stderr ~= '' and obj.stderr) or ('curl exit ' .. obj.code))
+        return
+      end
+      local code = tonumber(vim.trim(obj.stdout or '')) or 0
+      if code < 200 or code >= 300 then
+        callback(nil, 'Jira HTTP ' .. tostring(code))
+        return
+      end
+      callback(true)
+    end)
+  end)
+end
+
 function M.assign_self_qa(key, callback)
   if not key then
     callback(nil, 'no key')
