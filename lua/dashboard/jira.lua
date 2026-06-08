@@ -212,6 +212,14 @@ function M.pick_up_next(callback)
   )
 end
 
+function M.to_be_verified(callback)
+  search(
+    'project = VST AND status = "Verify" AND "QA Assignee" is EMPTY '
+      .. 'ORDER BY priority DESC, created ASC',
+    callback
+  )
+end
+
 function M.assign_self(key, callback)
   if not key then
     callback(nil, 'no key')
@@ -238,6 +246,59 @@ function M.assign_self(key, callback)
       '-X',
       'PUT',
       config.base_url .. '/rest/api/3/issue/' .. key .. '/assignee',
+      '-H',
+      'Authorization: Basic ' .. auth,
+      '-H',
+      'Accept: application/json',
+      '-H',
+      'Content-Type: application/json',
+      '-d',
+      body,
+    }, { text = true }, function(obj)
+      vim.schedule(function()
+        if obj.code ~= 0 then
+          callback(nil, (obj.stderr ~= '' and obj.stderr) or ('curl exit ' .. obj.code))
+          return
+        end
+        local code = tonumber(vim.trim(obj.stdout or '')) or 0
+        if code < 200 or code >= 300 then
+          callback(nil, 'Jira HTTP ' .. tostring(code))
+          return
+        end
+        callback(true)
+      end)
+    end)
+  end)
+end
+
+function M.assign_self_qa(key, callback)
+  if not key then
+    callback(nil, 'no key')
+    return
+  end
+  local auth, err = creds()
+  if not auth then
+    callback(nil, err or 'JIRA_EMAIL or JIRA_API_TOKEN not set')
+    return
+  end
+  M.fetch_myself(function(account_id, fetch_err)
+    if not account_id then
+      callback(nil, fetch_err or 'failed to resolve account id')
+      return
+    end
+    local body = vim.json.encode {
+      fields = { customfield_11615 = { accountId = account_id } },
+    }
+    vim.system({
+      'curl',
+      '-sS',
+      '-o',
+      '/dev/null',
+      '-w',
+      '%{http_code}',
+      '-X',
+      'PUT',
+      config.base_url .. '/rest/api/3/issue/' .. key,
       '-H',
       'Authorization: Basic ' .. auth,
       '-H',

@@ -749,6 +749,8 @@ local SECTION_LEVEL_COLLAPSE_DEFAULT = {
   ['Refinement'] = true,
   ['Other'] = true,
   ['Developer Verify'] = true,
+  ['Pick Up Next'] = true,
+  ['To Be Verified'] = true,
 }
 
 local function is_section_collapsed(title)
@@ -1500,6 +1502,9 @@ local function render()
   local pick_up_next = maybe_filter(state.data.pick_up_next, function(i)
     return issue_matches(i, f)
   end)
+  local to_be_verified = maybe_filter(state.data.to_be_verified, function(i)
+    return issue_matches(i, f)
+  end)
 
   emit_header(lines)
   emit_notes_section(lines, meta, f)
@@ -1582,6 +1587,10 @@ local function render()
   emit_section(lines, meta, 'Pick Up Next', pick_up_next, function(ls, m, issue)
     emit_issue(ls, m, issue, { pr_pool = pr_pool })
   end, 'Nothing unassigned in To Do', { pill_hl = 'DashboardPillInfo', collapsible = true })
+
+  emit_section(lines, meta, 'To Be Verified', to_be_verified, function(ls, m, issue)
+    emit_issue(ls, m, issue, { pr_pool = pr_pool })
+  end, 'Nothing waiting for QA assignee', { pill_hl = 'DashboardPillQA', collapsible = true })
 
   local qa_active = state.data.qa_active
   if state.filter and state.filter ~= '' and type(qa_active) == 'table' then
@@ -4323,6 +4332,26 @@ function M.assign_self_under_cursor()
   end)
 end
 
+function M.assign_qa_under_cursor()
+  local m = under_cursor()
+  if not m or m.kind ~= 'jira' or not m.key then
+    vim.notify('Place cursor on a Jira ticket row first', vim.log.levels.INFO)
+    return
+  end
+  local key = m.key
+  vim.notify('Setting you as QA Assignee on ' .. key .. '…', vim.log.levels.INFO)
+  require('dashboard.jira').assign_self_qa(key, function(ok, err)
+    if not ok then
+      vim.notify('QA assign failed: ' .. (err or 'unknown'), vim.log.levels.ERROR)
+      return
+    end
+    vim.notify(key .. ' QA Assignee set to you', vim.log.levels.INFO)
+    if buf_valid() then
+      M.refresh()
+    end
+  end)
+end
+
 function M.show_jira_activity(items)
   if not items or type(items) ~= 'table' or #items == 0 then
     vim.notify('No recent Jira activity', vim.log.levels.INFO)
@@ -5217,6 +5246,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
           stashes dirty work; switches to existing VST-NNN_* branch if any)
   C       read ticket description + comments in a panel
   A       assign this ticket to me (then refresh)
+  Q       set me as QA Assignee on this ticket (then refresh)
 
 ## Notifications
   x       mark notification as read
@@ -5395,6 +5425,7 @@ local function any_loading()
     or state.data.qa_active == nil
     or state.data.jira_activity == nil
     or state.data.pick_up_next == nil
+    or state.data.to_be_verified == nil
 end
 
 function stop_spinner()
@@ -5434,6 +5465,7 @@ function M.refresh()
     qa_active = nil,
     jira_activity = nil,
     pick_up_next = nil,
+    to_be_verified = nil,
   }
   start_spinner()
   render()
@@ -5483,6 +5515,7 @@ function M.refresh()
   jira.qa_assignee_active(update 'qa_active')
   jira.recent_activity(update 'jira_activity')
   jira.pick_up_next(update 'pick_up_next')
+  jira.to_be_verified(update 'to_be_verified')
   if not state.me_account_id then
     jira.fetch_myself(function(id)
       if id then
@@ -5549,6 +5582,7 @@ function M.open()
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
   vim.keymap.set('n', 'A', M.assign_self_under_cursor, opts)
+  vim.keymap.set('n', 'Q', M.assign_qa_under_cursor, opts)
   for _, item in ipairs(LEGEND_ITEMS) do
     vim.keymap.set('n', item.key, function()
       M.jump_to_section(item.target)
