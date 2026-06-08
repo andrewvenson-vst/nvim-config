@@ -1342,34 +1342,32 @@ local function rank_kind(k)
   return 3
 end
 
-local function note_segments(line, kind)
-  if kind == 'todo_open' then
-    local _, e = line:find '^%s*%-%s*%[%s%]'
-    return {
-      { text = line:sub(1, e), hl = 'DiagnosticWarn' },
-      { text = line:sub(e + 1), hl = 'Normal' },
-    }
-  elseif kind == 'todo_done' then
-    local _, e = line:find '^%s*%-%s*%[[xX]%]'
-    return {
-      { text = line:sub(1, e), hl = 'DashboardOk' },
-      { text = line:sub(e + 1), hl = 'Comment' },
-    }
-  end
-  return { { text = line, hl = 'Normal' } }
-end
-
 local function parse_note_entries(raw, filter)
   local entries = {}
+  local current
   for i, line in ipairs(raw or {}) do
     if line and line:gsub('%s', '') ~= '' then
-      table.insert(entries, { text = line, file_line = i, kind = note_kind(line) })
+      local is_indented = line:match '^%s' ~= nil
+      if not is_indented or not current then
+        current = { text = line, file_line = i, kind = note_kind(line), children = {} }
+        table.insert(entries, current)
+      else
+        table.insert(current.children, { text = line, file_line = i, kind = note_kind(line) })
+      end
     end
   end
   if filter and filter ~= '' then
     local kept = {}
     for _, e in ipairs(entries) do
-      if matches_filter(e.text, filter) then
+      local parent_match = matches_filter(e.text, filter)
+      local kept_children = {}
+      for _, c in ipairs(e.children) do
+        if matches_filter(c.text, filter) then
+          table.insert(kept_children, c)
+        end
+      end
+      if parent_match or #kept_children > 0 then
+        e.children = kept_children
         table.insert(kept, e)
       end
     end
@@ -1384,15 +1382,131 @@ local function parse_note_entries(raw, filter)
   return entries
 end
 
-local function render_note_entries(lines, meta, path, entries)
-  for _, e in ipairs(entries) do
-    local segs = { { text = '    ', hl = nil } }
-    for _, s in ipairs(note_segments(e.text, e.kind)) do
-      table.insert(segs, s)
+local function wrap_text(text, max_width)
+  if max_width < 1 or text == '' then
+    return { text }
+  end
+  local out = {}
+  local cur = ''
+  local cur_w = 0
+  for word, _ in text:gmatch '(%S+)(%s*)' do
+    local ww = vim.fn.strdisplaywidth(word)
+    if ww > max_width then
+      if cur ~= '' then
+        table.insert(out, cur)
+        cur, cur_w = '', 0
+      end
+      local rest = word
+      while vim.fn.strdisplaywidth(rest) > max_width do
+        local take = ''
+        for i = 1, #rest do
+          local cand = take .. rest:sub(i, i)
+          if vim.fn.strdisplaywidth(cand) > max_width then
+            break
+          end
+          take = cand
+        end
+        if take == '' then
+          take = rest:sub(1, 1)
+        end
+        table.insert(out, take)
+        rest = rest:sub(#take + 1)
+      end
+      if rest ~= '' then
+        cur, cur_w = rest, vim.fn.strdisplaywidth(rest)
+      end
+    elseif cur == '' then
+      cur, cur_w = word, ww
+    elseif cur_w + 1 + ww <= max_width then
+      cur = cur .. ' ' .. word
+      cur_w = cur_w + 1 + ww
+    else
+      table.insert(out, cur)
+      cur, cur_w = word, ww
     end
-    local idx, cols = emit(lines, segs)
-    paint(idx, cols)
-    meta[idx + 1] = { kind = 'note', path = path, file_line = e.file_line, todo_kind = e.kind }
+  end
+  if cur ~= '' then
+    table.insert(out, cur)
+  end
+  if #out == 0 then
+    table.insert(out, '')
+  end
+  return out
+end
+
+local function split_note_marker(line, kind)
+  if kind == 'todo_open' then
+    local _, e = line:find '^%s*%-%s*%[%s%]'
+    return line:sub(1, e), 'DiagnosticWarn', line:sub(e + 1), 'Normal'
+  elseif kind == 'todo_done' then
+    local _, e = line:find '^%s*%-%s*%[[xX]%]'
+    return line:sub(1, e), 'DashboardOk', line:sub(e + 1), 'Comment'
+  end
+  local bullet_end = line:match '^([%-%*])%s+()'
+  if bullet_end then
+    local _, e = line:find '^[%-%*]%s+'
+    return line:sub(1, e), 'NonText', line:sub(e + 1), 'Normal'
+  end
+  return '', nil, line, 'Normal'
+end
+
+local function render_note_entries(lines, meta, path, entries)
+  local win_w = (state.win and vim.api.nvim_win_is_valid(state.win))
+      and vim.api.nvim_win_get_width(state.win)
+    or 140
+  local base_indent = '    '
+  local base_indent_w = vim.fn.strdisplaywidth(base_indent)
+  local right_margin = 2
+
+  local function render_entry(entry, extra_indent_w)
+    local indent_str = base_indent .. string.rep(' ', extra_indent_w)
+    local indent_w = base_indent_w + extra_indent_w
+    local stripped = entry.text:gsub('^%s+', '')
+    local marker, marker_hl, body, body_hl = split_note_marker(stripped, entry.kind)
+    local marker_w = vim.fn.strdisplaywidth(marker)
+    local body_leading = body:match '^%s*' or ''
+    local body_trimmed = body:sub(#body_leading + 1)
+    local body_max = math.max(20, win_w - indent_w - marker_w - #body_leading - right_margin)
+    local pieces = wrap_text(body_trimmed, body_max)
+
+    for i, piece in ipairs(pieces) do
+      local segs
+      if i == 1 then
+        segs = {
+          { text = indent_str, hl = nil },
+          { text = marker, hl = marker_hl },
+          { text = body_leading .. piece, hl = body_hl },
+        }
+      else
+        segs = {
+          { text = indent_str .. string.rep(' ', marker_w) .. body_leading, hl = nil },
+          { text = piece, hl = body_hl },
+        }
+      end
+      local idx, cols = emit(lines, segs)
+      paint(idx, cols)
+      meta[idx + 1] = {
+        kind = 'note',
+        path = path,
+        file_line = entry.file_line,
+        todo_kind = entry.kind,
+        wrapped = (i > 1) or nil,
+      }
+    end
+  end
+
+  for _, e in ipairs(entries) do
+    render_entry(e, 0)
+    if e.children and #e.children > 0 then
+      local parent_marker, _, _, _ = split_note_marker(e.text:gsub('^%s+', ''), e.kind)
+      local child_indent = vim.fn.strdisplaywidth(parent_marker)
+      if child_indent == 0 then
+        child_indent = 2
+      end
+      for _, c in ipairs(e.children) do
+        render_entry(c, child_indent)
+      end
+    end
   end
 end
 
