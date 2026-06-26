@@ -1626,7 +1626,9 @@ local function render()
   emit_blank(lines)
   emit_pr_section(lines, meta, 'My PRs', my_prs, 'No open PRs', { draft = true })
   emit_pr_section(lines, meta, 'Awaiting my review', reviews, 'Inbox zero', {})
-  emit_pr_section(lines, meta, 'Tagged in', tagged, 'Nothing tagged', {})
+  if f and f ~= '' then
+    emit_pr_section(lines, meta, 'Tagged in', tagged, 'Nothing tagged', {})
+  end
 
   emit_divider(lines, 'Notifications')
   emit_blank(lines)
