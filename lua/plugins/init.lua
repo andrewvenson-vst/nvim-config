@@ -16,4 +16,5 @@ return {
   require 'plugins.debug',
   require 'plugins.neotest',
   require 'plugins.claudecode',
+  require 'plugins.git-diff',
 }

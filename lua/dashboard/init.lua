@@ -23,14 +23,6 @@ function M.setup(opts)
     require('dashboard.ui').focus_last_result()
   end, { desc = '[O]pen last [R]esult window' })
 
-  vim.keymap.set('n', '<leader>gd', function()
-    require('dashboard.ui').show_local_diff()
-  end, { desc = '[G]it local [D]iff (vs base branch)' })
-
-  vim.keymap.set('n', '<leader>gD', function()
-    require('dashboard.ui').show_local_diff_with_prompt()
-  end, { desc = '[G]it local [D]iff vs custom branch/commit' })
-
   vim.keymap.set('n', '<leader>jb', function()
     require('dashboard.ui').branch_picker()
   end, { desc = '[J]ira [B]ranch picker (tickets + existing local branches)' })
