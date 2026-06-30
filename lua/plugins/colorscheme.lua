@@ -8,7 +8,7 @@ function M.config()
   local everforest = require 'everforest'
   everforest.setup {
     background = 'dark',
-    transparent_background_level = 0,
+    transparent_background_level = 2,
     italics = true,
     disable_italic_comments = false,
     inlay_hints_background = 'dimmed',
@@ -17,17 +17,6 @@ function M.config()
       hl['DiagnosticUnderlineWarn'] = { undercurl = true, sp = palette.yellow }
     end,
   }
-
-  -- Force an opaque background so iTerm transparency doesn't bleed through nvim.
-  vim.api.nvim_create_autocmd('ColorScheme', {
-    pattern = '*',
-    callback = function()
-      local bg = '#2d353b' -- everforest dark medium
-      for _, g in ipairs { 'Normal', 'NormalNC', 'NormalFloat', 'SignColumn', 'EndOfBuffer' } do
-        vim.api.nvim_set_hl(0, g, { bg = bg })
-      end
-    end,
-  })
 
   everforest.load()
 end
