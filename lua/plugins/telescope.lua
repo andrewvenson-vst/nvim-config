@@ -103,5 +103,95 @@ return { -- Fuzzy Finder (files, lsp, etc)
     vim.keymap.set('n', '<leader>sn', function()
       builtin.find_files { cwd = vim.fn.stdpath 'config' }
     end, { desc = '[S]earch [N]eovim files' })
+
+    -- ######## PROJECT / SCRIPT SWITCHER ##################################
+    local home = os.getenv 'HOME'
+
+    local function list_entries(path, want_dirs)
+      local entries = {}
+      local ok, files = pcall(vim.fn.readdir, path)
+      if not ok then
+        return entries
+      end
+      for _, name in ipairs(files) do
+        local is_dir = vim.fn.isdirectory(path .. '/' .. name) == 1
+        if not vim.startswith(name, '.') and is_dir == want_dirs then
+          table.insert(entries, name)
+        end
+      end
+      table.sort(entries)
+      return entries
+    end
+
+    local function project_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      local projects_dir = home .. '/projects'
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'Projects',
+        finder = finders.new_table { results = list_entries(projects_dir, true) },
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            local project_path = projects_dir .. '/' .. selection[1]
+            vim.cmd('cd ' .. vim.fn.fnameescape(project_path))
+
+            local readme = project_path .. '/README.md'
+            local pkg = project_path .. '/package.json'
+            if vim.fn.filereadable(readme) == 1 then
+              vim.cmd('edit ' .. vim.fn.fnameescape(readme))
+            elseif vim.fn.filereadable(pkg) == 1 then
+              vim.cmd('edit ' .. vim.fn.fnameescape(pkg))
+            end
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    local function scripts_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      local scripts_dir = home .. '/scripts'
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'Scripts',
+        finder = finders.new_table { results = list_entries(scripts_dir, false) },
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            vim.cmd('edit ' .. vim.fn.fnameescape(scripts_dir .. '/' .. selection[1]))
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    vim.keymap.set('n', '<leader>sp', project_picker, { desc = '[S]earch [P]rojects' })
+    vim.keymap.set('n', '<leader>sc', scripts_picker, { desc = '[S]earch s[C]ripts' })
+    -- #################################################
   end,
 }
