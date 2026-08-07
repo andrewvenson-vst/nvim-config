@@ -1284,16 +1284,10 @@ local function emit_github_legend(lines)
     OPEN_BR,
     { text = 'c', hl = '@keyword' },
     { text = ' checkout · ', hl = 'Comment' },
-    { text = 'i', hl = '@keyword' },
-    { text = ' claude · ', hl = 'Comment' },
     { text = 'D', hl = '@keyword' },
     { text = ' diff · ', hl = 'Comment' },
     { text = 't', hl = '@keyword' },
-    { text = ' threads · ', hl = 'Comment' },
-    { text = 's', hl = '@keyword' },
-    { text = ' summary · ', hl = 'Comment' },
-    { text = '?', hl = '@keyword' },
-    { text = ' prompts', hl = 'Comment' },
+    { text = ' threads', hl = 'Comment' },
     CLOSE_BR,
   })
 end
@@ -1546,17 +1540,6 @@ local function emit_notes_section(lines, meta, filter)
   end
 
   emit_blank(lines)
-end
-
-local function emit_jira_legend(lines)
-  emit_legend(lines, {
-    OPEN_BR,
-    { text = 's', hl = '@keyword' },
-    { text = ' summary · ', hl = 'Comment' },
-    { text = '?', hl = '@keyword' },
-    { text = ' prompts', hl = 'Comment' },
-    CLOSE_BR,
-  })
 end
 
 local function emit_footer(lines)
@@ -2139,136 +2122,6 @@ local function build_repo_choices(starred)
   return choices
 end
 
--- Scan all configured repo_paths in parallel for local VST-* branches.
--- Calls cb(branches) once all repos have responded, where branches is a list
--- of { repo, repo_path, branch } entries.
-local function scan_vst_branches(cb)
-  local repos = {}
-  for repo, _ in pairs(config.repo_paths) do
-    local path = resolve_repo_path(repo)
-    if path then
-      table.insert(repos, { repo = repo, path = path })
-    end
-  end
-  if #repos == 0 then
-    cb({})
-    return
-  end
-  local branches = {}
-  local pending = #repos
-  for _, r in ipairs(repos) do
-    git_in(r.path, { 'branch', '--list', 'VST-*' }, function(obj)
-      if git_ok(obj) then
-        for line in (obj.stdout or ''):gmatch '[^\n]+' do
-          local name = line:gsub('^[%s%*]+', ''):gsub('%s+$', '')
-          if name ~= '' then
-            table.insert(branches, { repo = r.repo, repo_path = r.path, branch = name })
-          end
-        end
-      end
-      pending = pending - 1
-      if pending == 0 then
-        cb(branches)
-      end
-    end)
-  end
-end
-
-function M.branch_picker()
-  local jira = require 'dashboard.jira'
-  local results = { tickets = nil, branches = nil }
-  local errors = {}
-  local function maybe_open()
-    if results.tickets == nil or results.branches == nil then
-      return
-    end
-    local items = {}
-    for _, t in ipairs(results.tickets) do
-      table.insert(items, {
-        kind = 'ticket',
-        key = t.key,
-        summary = t.summary or '',
-        status = t.status or '',
-        label = string.format('[ticket] %s  %s  %s', t.key, t.status or '?', t.summary or ''),
-      })
-    end
-    for _, b in ipairs(results.branches) do
-      table.insert(items, {
-        kind = 'branch',
-        repo = b.repo,
-        repo_path = b.repo_path,
-        branch = b.branch,
-        label = string.format('[branch] %s · %s', repo_short(b.repo), b.branch),
-      })
-    end
-    if #items == 0 then
-      local msg = 'No active tickets or local VST-* branches found'
-      if #errors > 0 then
-        msg = msg .. ' (' .. table.concat(errors, '; ') .. ')'
-      end
-      vim.notify(msg, vim.log.levels.WARN)
-      return
-    end
-    vim.ui.select(items, {
-      prompt = 'Jira branch:',
-      format_item = function(it)
-        return it.label
-      end,
-    }, function(choice)
-      if not choice then
-        return
-      end
-      if choice.kind == 'branch' then
-        do_switch_branch(choice.repo_path, choice.branch)
-        return
-      end
-      -- Ticket: pick repo, then branch
-      local related = {}
-      for _, b in ipairs(results.branches) do
-        local key = b.branch:match '^(VST%-%d+)'
-        if key == choice.key then
-          table.insert(related, b.repo)
-        end
-      end
-      local repo_choices = build_repo_choices(related)
-      if #repo_choices == 0 then
-        vim.notify('No repos configured in repo_paths', vim.log.levels.WARN)
-        return
-      end
-      vim.ui.select(repo_choices, {
-        prompt = string.format('Branch %s in repo:', choice.key),
-        format_item = function(c)
-          return c.label
-        end,
-      }, function(rc)
-        if not rc then
-          return
-        end
-        local repo_path = resolve_repo_path(rc.repo)
-        if not repo_path then
-          vim.notify('No local path configured for ' .. rc.repo, vim.log.levels.WARN)
-          return
-        end
-        do_branch(repo_path, choice.key, choice.summary)
-      end)
-    end)
-  end
-
-  jira.assigned_active(function(tickets, err)
-    if err then
-      table.insert(errors, 'tickets: ' .. err)
-      results.tickets = {}
-    else
-      results.tickets = tickets or {}
-    end
-    maybe_open()
-  end)
-  scan_vst_branches(function(branches)
-    results.branches = branches
-    maybe_open()
-  end)
-end
-
 function M.branch_under_cursor()
   local m = under_cursor()
   if not m or m.kind ~= 'jira' or not m.key then
@@ -2295,32 +2148,6 @@ function M.branch_under_cursor()
       return
     end
     do_branch(repo_path, ticket_key, summary)
-  end)
-end
-
-function M.interactive_claude_under_cursor()
-  local m = under_cursor()
-  if not m or not m.pr then
-    return
-  end
-  if not in_tmux() then
-    vim.notify('Not in a tmux session', vim.log.levels.WARN)
-    return
-  end
-  local repo_path = resolve_repo_path(m.pr.repo)
-  if not repo_path then
-    vim.notify('No local path configured for ' .. m.pr.repo, vim.log.levels.WARN)
-    return
-  end
-  vim.notify(string.format('Checking out %s#%d for Claude…', m.pr.repo, m.pr.number), vim.log.levels.INFO)
-  vim.system({ 'gh', 'pr', 'checkout', tostring(m.pr.number) }, { cwd = repo_path, text = true }, function(obj)
-    vim.schedule(function()
-      if obj.code ~= 0 then
-        vim.notify('Checkout failed: ' .. (obj.stderr or 'unknown'), vim.log.levels.ERROR)
-        return
-      end
-      tmux_run({ 'claude' }, repo_path)
-    end)
   end)
 end
 
@@ -4416,7 +4243,7 @@ function M.comments_under_cursor()
   if not m or m.kind ~= 'jira' or not m.key then
     return
   end
-  local handle = open_result_window(m.key, nil, 'Loading ticket…')
+  local handle = open_result_window(m.key, 'Loading ticket…')
   require('dashboard.jira').fetch_issue(m.key, function(issue, err)
     if not issue then
       handle.set_error(err or 'failed to fetch')
@@ -4514,7 +4341,7 @@ function M.show_jira_activity(items)
     return
   end
   local current_items = items
-  local handle = open_result_window('Jira recent activity', nil, 'Loading…')
+  local handle = open_result_window('Jira recent activity', 'Loading…')
   local line_to_item
   local function show_list()
     handle.set_content(function(buf, win)
@@ -4586,7 +4413,7 @@ function M.actions_under_cursor()
     vim.notify('Place cursor on a PR or PR notification row first', vim.log.levels.INFO)
     return
   end
-  local handle = open_result_window('Actions · ' .. repo, nil, 'Loading workflow runs…')
+  local handle = open_result_window('Actions · ' .. repo, 'Loading workflow runs…')
   require('dashboard.github').fetch_actions(repo, function(items, err)
     if not items then
       handle.set_error(err or 'failed to fetch')
@@ -5063,7 +4890,7 @@ function M.diff_under_cursor()
   end)
 end
 
-function open_result_window(title, on_reprompt, loading_text)
+function open_result_window(title, loading_text)
   loading_text = loading_text or 'Loading…'
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].filetype = 'markdown'
@@ -5179,17 +5006,6 @@ function open_result_window(title, on_reprompt, loading_text)
     else
       set_lines(vim.split(text_or_renderer, '\n', { plain = true }))
     end
-    if on_reprompt then
-      local _, order = require('dashboard.claude').prompts()
-      for i, key in ipairs(order) do
-        if i <= 9 then
-          vim.keymap.set('n', tostring(i), function()
-            close()
-            on_reprompt(key)
-          end, opts)
-        end
-      end
-    end
   end
 
   local function set_error(msg)
@@ -5198,110 +5014,6 @@ function open_result_window(title, on_reprompt, loading_text)
   end
 
   return { set_content = set_content, set_error = set_error, close = close }
-end
-
-local function row_id(meta)
-  if meta.kind == 'pr' and meta.pr then
-    return meta.pr.repo .. '#' .. meta.pr.number
-  end
-  if meta.kind == 'jira' and meta.key then
-    return meta.key
-  end
-  return '?'
-end
-
-local function run_claude(meta, prompt_key)
-  local claude = require 'dashboard.claude'
-  local prompts_tbl = claude.prompts()
-  local label = (prompts_tbl[prompt_key] and prompts_tbl[prompt_key].label) or prompt_key
-  local title = string.format('%s · %s', label, row_id(meta))
-  local handle = open_result_window(title, function(next_key)
-    run_claude(meta, next_key)
-  end, 'Asking Claude…')
-  claude.analyze(meta, prompt_key, function(result, err)
-    if not result then
-      handle.set_error(err or 'unknown')
-      return
-    end
-    local prompts_tbl, order = claude.prompts()
-    handle.set_content(function(buf, _win)
-      local text = (result.text or ''):gsub('\r', '')
-      local body_lines = vim.split(text, '\n', { plain = true })
-      while #body_lines > 0 and body_lines[#body_lines] == '' do
-        table.remove(body_lines)
-      end
-
-      local footer_segs = { { text = '  ', hl = nil } }
-      for i, key in ipairs(order) do
-        if i > 1 then
-          table.insert(footer_segs, { text = '  ', hl = nil })
-        end
-        table.insert(footer_segs, { text = ' ' .. tostring(i) .. ' ', hl = 'DashboardPillInfo' })
-        table.insert(footer_segs, { text = ' ' .. (prompts_tbl[key].label or key):lower(), hl = 'Comment' })
-      end
-      table.insert(footer_segs, { text = '  ', hl = nil })
-      table.insert(footer_segs, { text = ' q ', hl = 'DashboardPillMuted' })
-      table.insert(footer_segs, { text = ' close', hl = 'Comment' })
-
-      local footer_text = ''
-      local footer_hls = {}
-      for _, s in ipairs(footer_segs) do
-        local col_start = #footer_text
-        footer_text = footer_text .. s.text
-        if s.hl then
-          table.insert(footer_hls, { col_start = col_start, col_end = #footer_text, hl = s.hl })
-        end
-      end
-
-      local lines = {}
-      for _, l in ipairs(body_lines) do
-        table.insert(lines, l)
-      end
-      table.insert(lines, '')
-      table.insert(lines, '')
-      local footer_line_idx = #lines
-      table.insert(lines, footer_text)
-
-      vim.bo[buf].modifiable = true
-      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-      vim.bo[buf].modifiable = false
-
-      for _, h in ipairs(footer_hls) do
-        vim.api.nvim_buf_set_extmark(buf, ns, footer_line_idx, h.col_start, {
-          end_col = h.col_end,
-          hl_group = h.hl,
-          priority = 100,
-        })
-      end
-    end)
-  end)
-end
-
-function M.analyze_under_cursor(prompt_key)
-  local m = under_cursor()
-  if not m or not m.kind then
-    return
-  end
-  run_claude(m, prompt_key or 'summary')
-end
-
-function M.pick_prompt_under_cursor()
-  local m = under_cursor()
-  if not m or not m.kind then
-    return
-  end
-  local claude = require 'dashboard.claude'
-  local prompts, order = claude.prompts()
-  local labels = {}
-  for _, k in ipairs(order) do
-    table.insert(labels, prompts[k].label)
-  end
-  vim.ui.select(labels, { prompt = 'Claude prompt:' }, function(_, idx)
-    if not idx then
-      return
-    end
-    run_claude(m, order[idx])
-  end)
 end
 
 function M.mark_read_under_cursor()
@@ -5381,7 +5093,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   <leader>gd   local git diff vs auto-detected base (develop → main → master)
   <leader>gD   local git diff vs chosen target (develop / main / Branch… / Commit…)
                diff title shows the resolved merge-base SHA + commit subject
-  <leader>jb   Jira branch picker (active tickets + existing local VST-* branches)
+  <leader>gl   local git diff vs last commit (HEAD) — uncommitted changes only
 
 ## Notes section
   N       new note (auto-prepends "- ")
@@ -5391,11 +5103,8 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
 
 ## GitHub PR rows
   c       checkout PR, open repo in nvim
-  i       checkout + claude interactive in tmux pane
   D       two-pane diff viewer (file list + diff, inline review threads)
   a       last 20 GitHub Actions runs for this PR's repo
-  s       claude summary
-  ?       claude prompt picker (summary / understand / risks / next / code review)
 
 ## Jira rows
   b       branch off latest main for this ticket (prompts repo;
@@ -5423,8 +5132,7 @@ local HELP_TEXT = [[# Status Dashboard — Keymaps
   r       refresh (local diff viewer only)
   q       close both panes
 
-## Claude / threads window
-  1-5     re-prompt against cached context
+## Result window (ticket / actions / comments)
   q       close
 
 ## Badge legend
@@ -5735,7 +5443,6 @@ function M.open()
   vim.keymap.set('n', 'y', M.yank_under_cursor, opts)
   vim.keymap.set('n', 'c', M.checkout_under_cursor, opts)
   vim.keymap.set('n', 'b', M.branch_under_cursor, opts)
-  vim.keymap.set('n', 'i', M.interactive_claude_under_cursor, opts)
   vim.keymap.set('n', 'D', M.diff_under_cursor, opts)
   vim.keymap.set('n', 'a', M.actions_under_cursor, opts)
   vim.keymap.set('n', 'A', M.assign_self_under_cursor, opts)
@@ -5760,10 +5467,6 @@ function M.open()
     end
   end, opts)
   vim.keymap.set('n', 'T', M.add_todo, opts)
-  vim.keymap.set('n', 's', function()
-    M.analyze_under_cursor 'summary'
-  end, opts)
-  vim.keymap.set('n', '?', M.pick_prompt_under_cursor, opts)
   vim.keymap.set('n', 'f', M.filter_prompt, opts)
   vim.keymap.set('n', 'g?', M.show_help, opts)
   vim.keymap.set('n', 'N', M.add_note, opts)

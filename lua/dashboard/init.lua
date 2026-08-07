@@ -3,7 +3,6 @@ local M = {}
 function M.setup(opts)
   opts = opts or {}
   require('dashboard.jira').setup(opts.jira)
-  require('dashboard.claude').setup(opts.claude)
   require('dashboard.notes').setup(opts.notes)
   require('dashboard.ui').setup {
     repo_paths = opts.repo_paths,
@@ -22,10 +21,6 @@ function M.setup(opts)
   vim.keymap.set('n', '<leader>or', function()
     require('dashboard.ui').focus_last_result()
   end, { desc = '[O]pen last [R]esult window' })
-
-  vim.keymap.set('n', '<leader>jb', function()
-    require('dashboard.ui').branch_picker()
-  end, { desc = '[J]ira [B]ranch picker (tickets + existing local branches)' })
 end
 
 return M

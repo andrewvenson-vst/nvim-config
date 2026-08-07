@@ -2,8 +2,8 @@
 
 A single floating window in Neovim that surfaces my GitHub PRs, GitHub
 notifications, Jira tickets, and today's notes/todos — with one-keystroke
-actions for opening, checking out, diffing, browsing review threads, asking
-Claude, and managing the daily notes file.
+actions for opening, checking out, diffing, browsing review threads, and
+managing the daily notes file.
 
 ## Features
 
@@ -27,16 +27,12 @@ Claude, and managing the daily notes file.
 - **Per-row actions**: open in browser, yank URL, checkout PR in a new tmux
   pane, view diff in a floating window, view all unresolved review threads,
   mark notification as read.
-- **Claude integration** via the local `claude` CLI (no API key needed) for
-  one-keystroke summary, understand, risks, next-step, and code-review prompts.
 
 ## Prerequisites
 
 - **Neovim 0.10+** (uses `vim.system`, `vim.uv`, `vim.base64`, `vim.json` with
   `luanil`).
 - **`gh` CLI**, authenticated: `gh auth login`.
-- **`claude` CLI** for the `s` / `?` prompt actions. Without it, those keys
-  surface a "claude CLI not found" notify and do nothing.
 - **`JIRA_EMAIL` and `JIRA_API_TOKEN`** env vars for the Jira section.
 - **tmux** (optional) for the `c` checkout action. Without it, `c` notifies
   "Not in a tmux session" and no-ops.
@@ -85,10 +81,6 @@ require('dashboard').setup {
   -- via the JIRA_BASE_URL env var.
   jira = { base_url = 'https://your-company.atlassian.net' },
 
-  -- Claude CLI model (optional). Pass any value the `claude --model` flag
-  -- accepts. Unset means use whatever your `claude` default is.
-  claude = { model = 'haiku-4-5' },
-
   -- Seconds before the dashboard auto-refreshes on FocusGained. Default 60.
   refresh_after = 60,
 
@@ -107,7 +99,7 @@ require('dashboard').setup {
 | Key | Action |
 | --- | --- |
 | `<leader>od` | Open the dashboard (or refocus if already open) |
-| `<leader>or` | Refocus the most recently opened result window (Claude / diff / threads) |
+| `<leader>or` | Refocus the most recently opened result window (diff / threads) |
 
 ### Inside the dashboard
 
@@ -124,11 +116,8 @@ PR rows additionally:
 | Key | Action |
 | --- | --- |
 | `c` | `gh pr checkout <num>` in the configured repo dir, then close the dashboard, `:tcd` into the repo, and open its `README.md` (or the repo dir if no README) for editing |
-| `i` | `gh pr checkout <num>` in the configured repo dir, then open a new tmux pane running `claude` interactively in that dir |
 | `D` | Show the PR diff in a two-pane floating window: file list on the left (`+N -M` stats), diff on the right. Inside: `<CR>` on a file jumps the diff to that file's hunk, `<Tab>` switches focus between panes, `q` closes both. |
 | `t` | Show all unresolved review threads with diff hunks and threaded comments |
-| `s` | Ask Claude for a one-keystroke summary |
-| `?` | Pick from: summary, understand, risks, next-step, code-review |
 
 Notification rows additionally:
 
@@ -145,14 +134,11 @@ Notes section additionally:
 | `x` | Toggle the checkbox on the cursor row (`- [ ]` ↔ `- [x]`) |
 | `<CR>` | Close dashboard and open today's notes file for editing |
 
-Jira rows: `s` and `?` work on tickets too.
-
-### Inside the result window (Claude / diff / threads)
+### Inside the result window (diff / threads)
 
 | Key | Action |
 | --- | --- |
 | `q` / `<Esc>` | Close |
-| `1` … `5` | Re-prompt against the cached context with the next prompt (Claude window only) |
 
 ## Caveats
 
@@ -169,9 +155,6 @@ Jira rows: `s` and `?` work on tickets too.
 - The unresolved-thread count comes from GraphQL `reviewThreads` and includes
   threads marked outdated. The `t` action surfaces them with an `[outdated]`
   tag so context isn't surprising.
-- Re-prompts in the Claude result window are instant because the fetched
-  context is cached per dashboard session. The cache clears when you close
-  the dashboard.
 - The notes section sorts entries for display (open todos → plain notes →
   completed todos), but the underlying file stays append-only chronological,
   so it remains grep-friendly and readable elsewhere.
