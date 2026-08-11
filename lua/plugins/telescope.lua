@@ -183,6 +183,7 @@ return { -- Fuzzy Finder (files, lsp, etc)
               return
             end
 
+            vim.cmd('cd ' .. vim.fn.fnameescape(scripts_dir))
             vim.cmd('edit ' .. vim.fn.fnameescape(scripts_dir .. '/' .. selection[1]))
           end)
           return true
@@ -192,6 +193,215 @@ return { -- Fuzzy Finder (files, lsp, etc)
 
     vim.keymap.set('n', '<leader>sp', project_picker, { desc = '[S]earch [P]rojects' })
     vim.keymap.set('n', '<leader>sc', scripts_picker, { desc = '[S]earch s[C]ripts' })
+
+    -- ######## CSV -> SQLITE TABLE ########################################
+    local function csv_to_sqlite(path)
+      if vim.fn.executable 'csv2sqlite' ~= 1 then
+        vim.notify('csv2sqlite is not on your PATH', vim.log.levels.ERROR)
+        return
+      end
+
+      local output = vim.trim(vim.fn.system { 'csv2sqlite', path })
+      if vim.v.shell_error ~= 0 then
+        vim.notify(output ~= '' and output or 'csv2sqlite failed', vim.log.levels.ERROR)
+        return
+      end
+
+      vim.notify(output)
+    end
+
+    local function csv_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      local downloads_dir = home .. '/Downloads'
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'CSV -> sqlite table',
+        finder = finders.new_oneshot_job({ 'rg', '--files', '--glob', '*.csv' }, { cwd = downloads_dir }),
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            csv_to_sqlite(downloads_dir .. '/' .. selection[1])
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    vim.keymap.set('n', '<leader>sq', csv_picker, { desc = '[S]earch csv -> s[Q]lite table' })
+
+    -- ######## DBUI SAVED QUERY FINDER ####################################
+    local function saved_query_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      local save_location = vim.fn.expand(vim.g.db_ui_save_location or '~/.local/share/db_ui')
+
+      require('lazy').load { plugins = { 'vim-dadbod-ui' } }
+
+      local connection_names = {}
+      for _, c in ipairs(vim.fn['db_ui#connections_list']()) do
+        connection_names[c.name] = true
+      end
+
+      local all_files = vim.fn.systemlist(
+        string.format("cd %s && rg --files --glob '!connections.json'", vim.fn.shellescape(save_location))
+      )
+      local files = {}
+      for _, rel in ipairs(all_files) do
+        local top = rel:match '^([^/]+)'
+        if top and connection_names[top] then
+          table.insert(files, rel)
+        end
+      end
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'DBUI Saved Queries',
+        finder = finders.new_table { results = files },
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            vim.cmd('edit ' .. vim.fn.fnameescape(save_location .. '/' .. selection[1]))
+            vim.fn['db_ui#find_buffer_silent']()
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    vim.keymap.set('n', '<leader>sQ', saved_query_picker, { desc = '[S]earch saved [Q]ueries (all dbs)' })
+
+    -- ######## DBUI OPEN (INCL. TEMPORARY) QUERY BUFFERS ##################
+    local function dbui_buffer_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      local entries = {}
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(buf) then
+          local ok, db_key = pcall(vim.api.nvim_buf_get_var, buf, 'dbui_db_key_name')
+          if ok and db_key ~= '' then
+            local name = vim.api.nvim_buf_get_name(buf)
+            table.insert(entries, {
+              bufnr = buf,
+              db = db_key,
+              name = name ~= '' and vim.fn.fnamemodify(name, ':t') or '[No Name]',
+            })
+          end
+        end
+      end
+
+      if #entries == 0 then
+        vim.notify('No open DBUI query/result buffers', vim.log.levels.INFO)
+        return
+      end
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'DBUI Open Queries (incl. unsaved)',
+        finder = finders.new_table {
+          results = entries,
+          entry_maker = function(entry)
+            return {
+              value = entry,
+              display = string.format('%s  %s', entry.db, entry.name),
+              ordinal = entry.db .. ' ' .. entry.name,
+            }
+          end,
+        },
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            vim.api.nvim_set_current_buf(selection.value.bufnr)
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    vim.keymap.set('n', '<leader>sB', dbui_buffer_picker, { desc = '[S]earch open db [B]uffers (incl. temp queries)' })
+
+    -- ######## CONNECT TO DB (picker instead of clicking the tree) ########
+
+    local function connect_to_db(db_name)
+      vim.fn['db_ui#new_query_buffer'](db_name)
+    end
+
+    local function db_connect_picker()
+      local pickers = require 'telescope.pickers'
+      local finders = require 'telescope.finders'
+      local conf = require('telescope.config').values
+      local actions = require 'telescope.actions'
+      local action_state = require 'telescope.actions.state'
+      local themes = require 'telescope.themes'
+
+      require('lazy').load { plugins = { 'vim-dadbod-ui' } }
+
+      local connections = vim.fn['db_ui#connections_list']()
+      if #connections == 0 then
+        vim.notify('No DBUI connections found', vim.log.levels.ERROR)
+        return
+      end
+
+      pickers.new(themes.get_dropdown(), {
+        prompt_title = 'Connect to DB',
+        finder = finders.new_table {
+          results = connections,
+          entry_maker = function(entry)
+            return {
+              value = entry,
+              display = entry.name .. (entry.is_connected == 1 and '  (connected)' or ''),
+              ordinal = entry.name,
+            }
+          end,
+        },
+        sorter = conf.generic_sorter {},
+        attach_mappings = function(prompt_bufnr)
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if not selection then
+              return
+            end
+
+            connect_to_db(selection.value.name)
+          end)
+          return true
+        end,
+      }):find()
+    end
+
+    vim.keymap.set('n', '<leader>sD', db_connect_picker, { desc = '[S]earch/connect to [D]b' })
     -- #################################################
   end,
 }
