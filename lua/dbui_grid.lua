@@ -114,29 +114,65 @@ function M.render(bufnr)
 end
 
 -- Sticky header: once a block's header row scrolls above the top of the
--- window, show it in the winbar instead of the connection status. Returned
--- as a statusline "smart eval" string (embedded %#Group# switches), and
+-- window, show it in the winbar instead of the connection status. Built as
+-- a statusline "smart eval" string (embedded %#Group# switches), and
 -- padded to match the window's number/signcolumn/foldcolumn gutter width
 -- so it lines up with the real header row underneath.
-function M.winbar()
-  local win = vim.api.nvim_get_current_win()
+--
+-- With 'nowrap' set on dbout buffers, the table can be scrolled
+-- horizontally ('leftcol' > 0). The header text is sliced at the same
+-- leftcol so it always shows exactly the columns currently visible below
+-- it, instead of always showing the unscrolled left edge of the header.
+--
+-- Computed for an explicit `win` via nvim_win_call rather than trusting
+-- "current window" context, and written directly into that window's
+-- 'winbar' option (M.refresh_winbar) instead of being wired up as a lazy
+-- %{luaeval(...)} expression -- Neovim only re-runs those when its own
+-- heuristics decide the statusline is dirty, which pure horizontal/vertical
+-- scrolling doesn't reliably trigger. Setting the option ourselves on every
+-- relevant event is the only way to guarantee it's actually current.
+local function compute(win)
   local bufnr = vim.api.nvim_win_get_buf(win)
 
   local blocks = vim.b[bufnr].dbui_grid_blocks
   if blocks then
-    local topline = vim.fn.line 'w0'
+    local topline, leftcol = unpack(vim.api.nvim_win_call(win, function()
+      return { vim.fn.line 'w0', vim.fn.winsaveview().leftcol }
+    end))
     for _, b in ipairs(blocks) do
       if topline > b.header_line and topline <= b.bottom then
         local ok, header = pcall(vim.api.nvim_buf_get_lines, bufnr, b.header_line - 1, b.header_line, false)
         if ok and header[1] then
           local info = vim.fn.getwininfo(win)[1]
-          local pad = string.rep(' ', info and info.textoff or 0)
-          return pad .. '%#DbUiGridHeader#' .. header[1]:gsub('|', '│') .. '%*'
+          local textoff = info and info.textoff or 0
+          local pad = string.rep(' ', textoff)
+          local textwidth = vim.api.nvim_win_get_width(win) - textoff
+          -- Cap to the window's visible text width *before* handing this to
+          -- 'winbar'. Without this, an oversized string just gets truncated
+          -- by Vim's own statusline renderer instead -- which, absent an
+          -- explicit '%<', truncates from the left and inserts its own '<'
+          -- marker, undoing the leftcol slice above and showing an
+          -- unrelated chunk of the header.
+          local visible = header[1]:sub(leftcol + 1, leftcol + textwidth)
+          return pad .. '%#DbUiGridHeader#' .. visible:gsub('|', '│') .. '%*'
         end
       end
     end
   end
   return '%#DbConnectedWinbar#' .. vim.fn['db_ui#statusline']() .. '%*'
+end
+
+function M.refresh_winbar(win)
+  win = win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local bufnr = vim.api.nvim_win_get_buf(win)
+  local ft = vim.bo[bufnr].filetype
+  if ft ~= 'dbout' and vim.fn.getbufvar(bufnr, 'db') == '' then
+    return
+  end
+  vim.wo[win].winbar = compute(win)
 end
 
 return M
